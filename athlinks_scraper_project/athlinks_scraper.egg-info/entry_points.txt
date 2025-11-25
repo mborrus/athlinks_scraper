@@ -1,0 +1,2 @@
+[console_scripts]
+athlinks-scraper = athlinks_scraper.cli:main

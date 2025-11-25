@@ -1,0 +1,11 @@
+README.md
+setup.py
+athlinks_scraper/__init__.py
+athlinks_scraper/cli.py
+athlinks_scraper/core.py
+athlinks_scraper.egg-info/PKG-INFO
+athlinks_scraper.egg-info/SOURCES.txt
+athlinks_scraper.egg-info/dependency_links.txt
+athlinks_scraper.egg-info/entry_points.txt
+athlinks_scraper.egg-info/requires.txt
+athlinks_scraper.egg-info/top_level.txt
