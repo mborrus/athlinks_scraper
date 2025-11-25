@@ -1,66 +1,33 @@
-# Athlinks Scraper
+# Athlinks Scraper & Analytics
 
-A Python package to scrape race results from Athlinks.com and export them to CSV.
+This repository contains tools to scrape race results from Athlinks.com and a dashboard to analyze and visualize them.
 
-## Features
+## Components
 
--   Fetches all results for a given event.
--   Handles pagination automatically.
--   Calculates **Pace** (min/mi) for each runner.
--   Exports data to a clean CSV file.
+### 1. [Athlinks Scraper](athlinks_scraper_project/README.md)
+A Python package to fetch race results, handle pagination, and export data to CSV.
 
-## Installation
+- **Features**: Scrapes all results, calculates pace, exports to CSV.
+- **Location**: `athlinks_scraper_project/`
 
-1.  Navigate to the project directory:
-    ```bash
-    cd athlinks_scraper_project
-    ```
+### 2. [Race Analytics Dashboard](dashboard/README.md)
+A Streamlit-based dashboard to explore your race data.
 
-2.  Install the package in editable mode:
-    ```bash
-    pip install -e .
-    ```
+- **Features**: Performance trends, pace distribution, runner lookup, pace partners.
+- **Location**: `dashboard/`
 
-## Usage
+## Quick Start
 
-Once installed, you can use the `athlinks-scraper` command from anywhere.
-
-### Basic Usage
-
+### Scraper
 ```bash
-athlinks-scraper "https://www.athlinks.com/event/15776/results/Event/1096764/Results"
+cd athlinks_scraper_project
+pip install -e .
+athlinks-scraper "https://www.athlinks.com/event/..."
 ```
 
-This will generate a `results.csv` file in your current directory.
-
-### Specify Output File
-
-You can specify a custom output filename using the `--output` or `-o` flag:
-
+### Dashboard
 ```bash
-athlinks-scraper "https://www.athlinks.com/event/15776/results/Event/1096764/Results" --output my_race_results.csv
+cd dashboard
+pip install -r requirements.txt
+streamlit run app.py
 ```
-
-### Running without Installation
-
-If you prefer not to install the package, you can run it directly using Python:
-
-```bash
-# From the parent directory
-PYTHONPATH=athlinks_scraper_project python -m athlinks_scraper.cli "URL_HERE"
-```
-
-## Output Format
-
-The generated CSV contains the following columns:
--   Name
--   Gender
--   Age
--   Bib
--   City, State, Country
--   Time (Chip time)
--   Pace (min/mi)
--   Overall Rank
--   Gender Rank
--   Division Rank
--   Status
