@@ -9,7 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'athlinks_scraper_
 
 from athlinks_scraper.core import get_results, extract_master_id, extract_event_id, fetch_master_events, fetch_metadata
 from athlinks_scraper.core import get_results, extract_master_id, extract_event_id, fetch_master_events, fetch_metadata
-from dashboard_queries import init_db, get_event_names, create_enriched_view, get_overview_stats, get_pace_partners, get_fun_stats, get_distribution, get_trends, get_runner_history, get_nemesis, get_retention_data, get_fastest_by_year, get_fastest_by_demographics, get_division_stats, get_era_stats, get_raw_times, get_avg_annual_runners
+from dashboard_queries import init_db, get_event_names, create_enriched_view, get_overview_stats, get_pace_partners, get_fun_stats, get_distribution, get_trends, get_runner_history, get_nemesis, get_retention_data, get_fastest_by_year, get_fastest_by_demographics, get_division_stats, get_era_stats, get_raw_times, get_avg_annual_runners, save_custom_event_name
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Athlinks Race Analytics", layout="wide")
@@ -233,6 +233,15 @@ if events:
     selected_name = st.sidebar.selectbox("Choose Race", event_options, index=0)
     selected_master_id = event_map[selected_name]
 
+    # Rename Event UI
+    with st.sidebar.expander("Event Settings"):
+        new_name = st.text_input("Rename Event", value=selected_name)
+        if st.button("Save Name"):
+            if new_name and new_name != selected_name:
+                save_custom_event_name(selected_master_id, new_name)
+                st.success("Name saved!")
+                st.rerun()
+
 # Create the view based on selection
 create_enriched_view(con, selected_master_id)
 
@@ -269,8 +278,8 @@ with tab1:
         # Narrative Context
         st.markdown("""
         <div style="font-family: 'Lora', serif; font-size: 1.1rem; line-height: 1.6; color: #374151; margin-bottom: 2rem;">
-        The Turkey Trot has evolved from a local gathering to a competitive regional event. 
-        While participation has surged, the core spirit of the race remains grounded in community tradition.
+        To many, their community Turkey Trot is a fun family tradition. To others, it is a once-a-year opportunity to race their 7th grade English teacher. 
+        For me, it's a chance to get passed by a 16 year old in a turkey costume. This site is to help you understand your race history, find your rivals, and learn some fun facts.
         </div>
         """, unsafe_allow_html=True)
 

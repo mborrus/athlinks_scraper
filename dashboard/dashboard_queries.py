@@ -82,10 +82,37 @@ def init_db(uploaded_files):
     
     return con
 
+
+import json
+import os
+
+def get_metadata_path():
+    return os.path.join(os.path.dirname(__file__), "data", "event_metadata.json")
+
+def load_event_metadata():
+    path = get_metadata_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_custom_event_name(master_id, new_name):
+    metadata = load_event_metadata()
+    metadata[str(master_id)] = new_name.strip()
+    
+    path = get_metadata_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
 def get_event_names(con):
     """
     Returns a list of dictionaries with 'master_id' and 'display_name'.
-    Groups by Master ID and picks the most recent Event Name.
+    Groups by Master ID and picks the most recent Event Name, 
+    overridden by custom names if available.
     """
     try:
         # Get distinct Master IDs and their most recent Event Name
@@ -99,7 +126,16 @@ def get_event_names(con):
             ORDER BY display_name ASC
         """
         df = con.execute(query).df()
-        return df.to_dict('records')
+        events = df.to_dict('records')
+        
+        # Apply custom overrides
+        metadata = load_event_metadata()
+        for event in events:
+            mid = str(event['master_id'])
+            if mid in metadata:
+                event['display_name'] = metadata[mid]
+                
+        return events
     except Exception as e:
         print(f"Error getting event names: {e}")
         return []
