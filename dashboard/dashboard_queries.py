@@ -619,13 +619,56 @@ def get_raw_times(con):
             WITH primary_race AS (
                 SELECT "Race Type Normalized" FROM results_enriched GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
             )
-            SELECT time_seconds
+            SELECT time_seconds, "Gender", "Age", event_year
             FROM results_enriched
             WHERE "Race Type Normalized" = (SELECT * FROM primary_race) AND time_seconds IS NOT NULL
         """
         return con.execute(query).df()
     except Exception as e:
         print(f"Error getting raw times: {e}")
+        return pd.DataFrame()
+
+def get_competitiveness_stats(con, gender="All", age_min=0, age_max=100):
+    """
+    Returns the 3rd and 10th place times by year, filtered by demographics.
+    """
+    try:
+        # Build Filter Clause
+        filters = []
+        if gender != "All":
+            filters.append(f"\"Gender\" = '{gender}'")
+        
+        filters.append(f"\"Age\" BETWEEN {age_min} AND {age_max}")
+        
+        where_clause = " AND ".join(filters)
+        if where_clause:
+            where_clause = "AND " + where_clause
+
+        query = f"""
+            WITH primary_race AS (
+                SELECT "Race Type Normalized" FROM results_enriched GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+            ),
+            ranked AS (
+                SELECT 
+                    event_year,
+                    time_seconds,
+                    ROW_NUMBER() OVER (PARTITION BY event_year ORDER BY time_seconds ASC) as rn
+                FROM results_enriched
+                WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
+                  {where_clause}
+            )
+            SELECT 
+                event_year,
+                MAX(CASE WHEN rn = 3 THEN time_seconds END) as time_top_3,
+                MAX(CASE WHEN rn = 10 THEN time_seconds END) as time_top_10
+            FROM ranked
+            WHERE rn IN (3, 10)
+            GROUP BY event_year
+            ORDER BY event_year
+        """
+        return con.execute(query).df()
+    except Exception as e:
+        print(f"Error getting competitiveness stats: {e}")
         return pd.DataFrame()
 
 def get_avg_annual_runners(con):

@@ -9,7 +9,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'athlinks_scraper_
 
 from athlinks_scraper.core import get_results, extract_master_id, extract_event_id, fetch_master_events, fetch_metadata
 from athlinks_scraper.core import get_results, extract_master_id, extract_event_id, fetch_master_events, fetch_metadata
-from dashboard_queries import init_db, get_event_names, create_enriched_view, get_overview_stats, get_pace_partners, get_fun_stats, get_distribution, get_trends, get_runner_history, get_nemesis, get_retention_data, get_fastest_by_year, get_fastest_by_demographics, get_division_stats, get_era_stats, get_raw_times, get_avg_annual_runners, save_custom_event_name
+from dashboard_queries import init_db, get_event_names, create_enriched_view, get_overview_stats, get_pace_partners, get_fun_stats, get_distribution, get_trends, get_runner_history, get_nemesis, get_retention_data, get_fastest_by_year, get_fastest_by_demographics, get_division_stats, get_era_stats, get_raw_times, get_avg_annual_runners, save_custom_event_name, get_competitiveness_stats
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Athlinks Race Analytics", layout="wide")
@@ -439,6 +439,58 @@ with tab1:
 
 
 
+    # --- Competitiveness by Year ---
+    st.header("Yearly Competitiveness")
+    st.markdown("""
+    <div style="font-family: 'Lora', serif; font-size: 1rem; font-style: italic; color: #4B5563; margin-bottom: 1.5rem;">
+    How fast do you need to be to make the podium? Track the "cost of entry" for the Top 3 and Top 10 over time.
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_comp1, col_comp2 = st.columns([1, 3])
+    
+    with col_comp1:
+        st.markdown("### Filters")
+        comp_gender = st.selectbox("Gender", ["All", "M", "F"], key="comp_gender")
+        comp_age = st.slider("Age Range", 0, 100, (0, 100), key="comp_age")
+
+    with col_comp2:
+        comp_stats = get_competitiveness_stats(con, gender=comp_gender, age_min=comp_age[0], age_max=comp_age[1])
+        
+        if not comp_stats.empty:
+            # Convert seconds to datetime for proper formatting
+            comp_stats["Top 3 Time"] = pd.to_datetime(comp_stats["time_top_3"], unit='s')
+            comp_stats["Top 10 Time"] = pd.to_datetime(comp_stats["time_top_10"], unit='s')
+            
+            # Melt for Plotly
+            comp_melted = comp_stats.melt(id_vars=["event_year"], 
+                                          value_vars=["Top 3 Time", "Top 10 Time"],
+                                          var_name="Metric", value_name="Time")
+            
+            # Create Label for text
+            comp_melted["Label"] = comp_melted["Time"].dt.strftime("%M:%S")
+            
+            fig_comp = px.line(comp_melted, x="event_year", y="Time", color="Metric", markers=True,
+                               title="Time Required to Place (Top 3 vs Top 10)", text="Label",
+                               color_discrete_map={
+                                   "Top 3 Time": "#EA580C", 
+                                   "Top 10 Time": "#2563EB"
+                               })
+            
+            fig_comp.update_traces(textposition="top center")
+            fig_comp.update_layout(
+                yaxis_tickformat="%M:%S",
+                xaxis_title="Event Year",
+                yaxis_title="Finish Time"
+            )
+            
+            display_chart(fig_comp)
+        else:
+            st.warning("No data found for these filters.")
+            
+    st.divider()
+
+
     # --- Advanced Analytics ---
     st.header("Advanced Analytics")
     
@@ -621,6 +673,10 @@ with tab4:
         target_time_input = st.text_input("Target Time (MM:SS)", "25:00")
         runner_history_name = st.text_input("Show My History (Name)", placeholder="e.g. Mr. Gobble")
         
+        st.markdown("### Filters")
+        gender_filter = st.selectbox("Gender", ["All", "M", "F"])
+        age_filter = st.slider("Age Range", 0, 100, (0, 100))
+
         # Parse Input
         target_seconds = None
         if target_time_input:
@@ -637,7 +693,22 @@ with tab4:
 
     if target_seconds:
         raw_times = get_raw_times(con)
-        avg_runners = get_avg_annual_runners(con)
+        
+        # Apply Filters
+        if not raw_times.empty:
+            if gender_filter != "All":
+                raw_times = raw_times[raw_times["Gender"] == gender_filter]
+            
+            raw_times = raw_times[
+                (raw_times["Age"] >= age_filter[0]) & 
+                (raw_times["Age"] <= age_filter[1])
+            ]
+
+        # Calculate avg_runners dynamically based on filtered data
+        if not raw_times.empty:
+            avg_runners = len(raw_times) / raw_times['event_year'].nunique()
+        else:
+            avg_runners = 0
         
         if not raw_times.empty and avg_runners > 0:
             all_seconds = raw_times['time_seconds'].sort_values()
@@ -654,7 +725,7 @@ with tab4:
                 <div style="font-family: 'Inter', sans-serif; color: #6B7280; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px;">Predicted Finish</div>
                 <div style="font-family: 'Lora', serif; color: #111827; font-size: 2.5rem; font-weight: 700;">{predicted_place}<span style="font-size: 1.5rem; vertical-align: super;">th</span> Place</div>
                 <div style="font-family: 'Inter', sans-serif; color: #4B5563; font-size: 1rem; margin-top: 5px;">
-                    You would be faster than <strong>{100 - (percentile * 100):.1f}%</strong> of runners in a typical field of {int(avg_runners)}.
+                    You would be faster than <strong>{100 - (percentile * 100):.1f}%</strong> of runners in a typical field of {int(avg_runners)} (Filtered).
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -685,7 +756,7 @@ with tab4:
             # Highlight target bin
             df_hist['Color'] = df_hist['Seconds'].apply(lambda x: '#EA580C' if x == target_seconds else '#e09451')
             
-            fig = px.bar(df_hist, x='Seconds', y='Count', title="Finish Time Distribution",
+            fig = px.bar(df_hist, x='Seconds', y='Count', title="Finish Time Distribution (Filtered)",
                          hover_data=['TimeStr'], color='Color', color_discrete_map="identity")
             
             # Add vertical line for target
