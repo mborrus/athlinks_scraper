@@ -22,8 +22,14 @@ A Streamlit-based dashboard to explore your race data.
 ```bash
 cd athlinks_scraper_project
 pip install -e .
-athlinks-scraper "https://www.athlinks.com/event/..."
+athlinks-scraper "https://www.athlinks.com/event/15776" --all-years -d out/
+athlinks-scraper "https://results.nyrr.org/event/24FROSTY/finishers" --all-years -d out/
+athlinks-scraper "https://runsignup.com/Race/Results/100692" --all-years -d out/
 ```
+
+Supported sources: Athlinks (`athlinks.com`), New York Road Runners (`results.nyrr.org`),
+RunSignup (`runsignup.com` — use the *Results* page URL, which contains the numeric race id).
+None require an API key.
 
 ### Dashboard
 ```bash
