@@ -31,3 +31,23 @@ cd dashboard
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Development
+
+Install everything (both components plus pytest) from the repository root:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run the test suite from the repository root (not from a subdirectory):
+
+```bash
+python -m pytest tests -v
+```
+
+The tests never contact Athlinks; HTTP is faked in `tests/fakes.py`. The dashboard
+query layer is tested against a small in-memory DuckDB table built in `tests/conftest.py`.
+
+`test_url.py` and `test_metadata.py` at the repo root are ad-hoc debugging scripts that
+hit the live API; they are not part of the test suite.
