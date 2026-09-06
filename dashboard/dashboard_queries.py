@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 
@@ -12,6 +13,21 @@ RESULT_COLUMNS = [
     "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
     "Gender Rank", "Division Rank", "Status", "Master ID",
 ]
+
+
+def format_seconds(total_seconds):
+    """
+    1500 -> "25:00"; 3725 -> "1:02:05"; None or NaN -> "N/A".
+    Used wherever the UI shows a duration computed in SQL.
+    """
+    if total_seconds is None or (isinstance(total_seconds, float) and math.isnan(total_seconds)):
+        return "N/A"
+    total_seconds = int(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
 
 
 def extract_master_id_from_filename(filename):
@@ -192,28 +208,40 @@ def create_enriched_view(con, selected_master_id=None):
 
 def get_overview_stats(con):
     """
-    Returns basic stats: Total Runners, Avg Time, Fastest Time, and Fastest Runner Name.
+    Headline numbers for the primary race type: total finishers, average pace,
+    fastest/slowest time, who set the fastest time and in which year, and the
+    first year of data.
     """
     try:
         query = """
             WITH primary_race AS (
-                SELECT "Race Type Normalized" 
-                FROM results_enriched 
-                GROUP BY "Race Type Normalized" 
-                ORDER BY COUNT(*) DESC 
-                LIMIT 1
+                SELECT "Race Type Normalized" FROM results_enriched
+                GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+            ),
+            primary_rows AS (
+                SELECT * FROM results_enriched
+                WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
+            ),
+            fastest AS (
+                SELECT "Time", "Name", event_year
+                FROM primary_rows ORDER BY time_seconds ASC LIMIT 1
+            ),
+            slowest AS (
+                SELECT "Time" FROM primary_rows ORDER BY time_seconds DESC LIMIT 1
             )
-            SELECT 
+            SELECT
                 COUNT(*) as total_runners,
                 AVG(pace_seconds) as avg_pace_seconds,
-                (SELECT "Time" FROM results_enriched WHERE "Race Type Normalized" = (SELECT * FROM primary_race) ORDER BY time_seconds ASC LIMIT 1) as fastest_time,
-                (SELECT "Name" FROM results_enriched WHERE "Race Type Normalized" = (SELECT * FROM primary_race) ORDER BY time_seconds ASC LIMIT 1) as fastest_runner,
-                (SELECT "Time" FROM results_enriched WHERE "Race Type Normalized" = (SELECT * FROM primary_race) ORDER BY time_seconds DESC LIMIT 1) as slowest_time
-            FROM results_enriched
-            WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
+                (SELECT "Time" FROM fastest) as fastest_time,
+                (SELECT "Name" FROM fastest) as fastest_runner,
+                (SELECT event_year FROM fastest) as fastest_year,
+                MIN(event_year) as first_year,
+                (SELECT "Time" FROM slowest) as slowest_time
+            FROM primary_rows
         """
         return con.execute(query).df()
-    except Exception:
+    except Exception as e:
+        print(f"Error getting overview stats: {e}")
         return pd.DataFrame()
 
 def get_pace_partners(con, target_str, tolerance_seconds=10, search_type="Pace"):
@@ -267,22 +295,27 @@ def get_pace_partners(con, target_str, tolerance_seconds=10, search_type="Pace")
 
 def get_fun_stats(con):
     """
-    Returns some fun stats like most frequent runners.
+    "Frequent Flyers": runners who appear in more than one year, with their
+    best (lowest) pace. Pace is compared numerically via pace_seconds — the
+    "Pace" column is a string and would sort "10:00" before "9:40".
     """
     try:
-        # Hall of Fame (Most Races)
-        # Only useful if multiple files loaded
-        hall_of_fame = con.execute("""
-            SELECT "Name", COUNT(DISTINCT event_year) as race_count, MIN("Pace") as best_pace
+        df = con.execute("""
+            SELECT
+                "Name",
+                COUNT(DISTINCT event_year) as race_count,
+                MIN(pace_seconds) as best_pace_seconds
             FROM results_enriched
+            WHERE pace_seconds IS NOT NULL
             GROUP BY "Name_Normalized", "Name"
             HAVING COUNT(DISTINCT event_year) > 1
-            ORDER BY race_count DESC, best_pace ASC
+            ORDER BY race_count DESC, best_pace_seconds ASC
             LIMIT 10
         """).df()
-        
-        return hall_of_fame
-    except Exception:
+        df["best_pace"] = df["best_pace_seconds"].apply(format_seconds)
+        return df[["Name", "race_count", "best_pace"]]
+    except Exception as e:
+        print(f"Error getting fun stats: {e}")
         return pd.DataFrame()
 
 def get_distribution(con):
