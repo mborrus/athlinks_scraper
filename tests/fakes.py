@@ -21,14 +21,25 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Returns the queued responses in order; records every call made."""
+    """Returns the queued responses in order; records every call made.
+
+    GET calls are recorded as (url, params, timeout).
+    POST calls are recorded as (url, json_body, timeout).
+    """
 
     def __init__(self, responses):
         self.responses = list(responses)
-        self.calls = []  # list of (url, params, timeout)
+        self.calls = []
 
-    def get(self, url, params=None, timeout=None):
-        self.calls.append((url, params, timeout))
+    def _next(self):
         if not self.responses:
             raise AssertionError("FakeSession ran out of queued responses")
         return self.responses.pop(0)
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params, timeout))
+        return self._next()
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append((url, json, timeout))
+        return self._next()

@@ -59,6 +59,17 @@ def fetch_json(url, params=None, session=None, timeout=DEFAULT_TIMEOUT):
     return response.json()
 
 
+def post_json(url, body, session=None, timeout=DEFAULT_TIMEOUT):
+    """
+    POSTs `body` as JSON to `url` and returns the parsed JSON response.
+    Raises requests.RequestException on failure (after the session's retries).
+    """
+    session = session or get_session()
+    response = session.post(url, json=body, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
 def extract_event_id(url):
     """
     Extracts the specific Event ID from an Athlinks URL.
