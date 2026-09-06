@@ -646,3 +646,106 @@ def get_avg_annual_runners(con):
     except Exception as e:
         print(f"Error getting avg annual runners: {e}")
         return 0
+
+
+# --- Feature queries ------------------------------------------------------
+
+_PRIMARY_RACE = """(
+    SELECT "Race Type Normalized" FROM results_enriched
+    GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+)"""
+
+
+def search_runner_names(con, fragment):
+    """Distinct normalized names containing `fragment` (case-insensitive), sorted."""
+    try:
+        df = con.execute(
+            'SELECT "Name_Normalized" FROM results_enriched WHERE "Name_Normalized" ILIKE ? '
+            'GROUP BY "Name_Normalized" ORDER BY "Name_Normalized"',
+            [f"%{fragment}%"],
+        ).df()
+        return df["Name_Normalized"].tolist()
+    except Exception as e:
+        print(f"Error searching names: {e}")
+        return []
+
+
+def get_runner_yearly(con, name_norm):
+    """
+    One row per year the runner finished the primary race: their time/pace,
+    computed place, field size, % of the field they beat, and the field median.
+    """
+    try:
+        query = f"""
+            WITH field AS (
+                SELECT event_year, COUNT(*) AS field_size, MEDIAN(time_seconds) AS median_seconds
+                FROM results_enriched
+                WHERE "Race Type Normalized" = {_PRIMARY_RACE}
+                GROUP BY event_year
+            ),
+            me AS (
+                SELECT event_year, "Time", "Pace", time_seconds
+                FROM results_enriched
+                WHERE "Name_Normalized" = ? AND "Race Type Normalized" = {_PRIMARY_RACE}
+            ),
+            placed AS (
+                SELECT m.*,
+                    (SELECT COUNT(*) FROM results_enriched r
+                     WHERE r.event_year = m.event_year
+                       AND r."Race Type Normalized" = {_PRIMARY_RACE}
+                       AND r.time_seconds < m.time_seconds) + 1 AS place
+                FROM me m
+            )
+            SELECT p.event_year, p."Time", p."Pace", p.time_seconds, p.place, f.field_size,
+                   ROUND(100.0 * (f.field_size - p.place) / f.field_size, 1) AS pct_beaten,
+                   f.median_seconds
+            FROM placed p JOIN field f USING (event_year)
+            ORDER BY p.event_year
+        """
+        return con.execute(query, [name_norm]).df()
+    except Exception as e:
+        print(f"Error getting runner yearly: {e}")
+        return pd.DataFrame()
+
+
+def get_head_to_head(con, name_a, name_b):
+    """Years both runners finished the same race type; diff_seconds = A - B."""
+    try:
+        query = """
+            SELECT a.event_year, a."Time" AS time_a, b."Time" AS time_b,
+                   a.time_seconds - b.time_seconds AS diff_seconds
+            FROM results_enriched a
+            JOIN results_enriched b
+              ON a.event_year = b.event_year
+             AND a."Race Type Normalized" = b."Race Type Normalized"
+            WHERE a."Name_Normalized" = ? AND b."Name_Normalized" = ?
+            ORDER BY a.event_year
+        """
+        return con.execute(query, [name_a, name_b]).df()
+    except Exception as e:
+        print(f"Error getting head to head: {e}")
+        return pd.DataFrame()
+
+
+def get_returning_counts(con):
+    """Per year: how many finishers were new vs had raced in an earlier year."""
+    try:
+        query = """
+            WITH first_seen AS (
+                SELECT "Name_Normalized", MIN(event_year) AS first_year
+                FROM results_enriched GROUP BY "Name_Normalized"
+            ),
+            appearances AS (
+                SELECT DISTINCT "Name_Normalized", event_year FROM results_enriched
+            )
+            SELECT a.event_year,
+                   CAST(SUM(CASE WHEN a.event_year = f.first_year THEN 1 ELSE 0 END) AS INTEGER) AS new_runners,
+                   CAST(SUM(CASE WHEN a.event_year > f.first_year THEN 1 ELSE 0 END) AS INTEGER) AS returning_runners
+            FROM appearances a JOIN first_seen f USING ("Name_Normalized")
+            GROUP BY a.event_year
+            ORDER BY a.event_year
+        """
+        return con.execute(query).df()
+    except Exception as e:
+        print(f"Error getting returning counts: {e}")
+        return pd.DataFrame()
