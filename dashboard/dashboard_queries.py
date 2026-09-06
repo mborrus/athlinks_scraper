@@ -1,90 +1,78 @@
+import json
+import os
+import re
+
 import duckdb
 import pandas as pd
 
 # Dashboard Queries Module
-def init_db(uploaded_files):
+
+RESULT_COLUMNS = [
+    "Event ID", "Event Name", "Event Date", "Race Type", "Name", "Gender", "Age",
+    "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
+    "Gender Rank", "Division Rank", "Status", "Master ID",
+]
+
+
+def extract_master_id_from_filename(filename):
+    """scraped_15776_2023.parquet -> '15776'; anything else -> None."""
+    match = re.search(r'scraped_(\d+)_', filename)
+    if match:
+        return match.group(1)
+    return None
+
+
+def init_db_from_dataframe(df):
     """
-    Initializes an in-memory DuckDB connection and loads CSV files.
-    Returns the connection object.
+    Creates an in-memory DuckDB connection with `df` registered as the
+    `results` table. This is the seam that tests use.
     """
     con = duckdb.connect(database=':memory:')
-    
-    # Create a list to hold all dataframes
-    dfs = []
-    
-    import re
+    con.register('results', df)
+    return con
 
-    def extract_master_id_from_filename(filename):
-        match = re.search(r'scraped_(\d+)_', filename)
-        if match:
-            return match.group(1)
-        return None
+
+def init_db(uploaded_files):
+    """
+    Loads uploaded CSVs plus every CSV/Parquet in dashboard/data/ into one
+    DataFrame and returns a DuckDB connection with it registered as `results`.
+    """
+    dfs = []
 
     for uploaded_file in uploaded_files:
         try:
             df = pd.read_csv(uploaded_file)
-            # Ensure column names are consistent/clean
             df.columns = [c.strip() for c in df.columns]
-            
-            # Try to get Master ID from filename
-            master_id = extract_master_id_from_filename(uploaded_file.name)
-            if master_id:
-                df['Master ID'] = master_id
-            else:
-                df['Master ID'] = None
-                
+            df['Master ID'] = extract_master_id_from_filename(uploaded_file.name)
             dfs.append(df)
         except Exception as e:
             print(f"Error loading {uploaded_file.name}: {e}")
 
-    # Load local files from data directory
-    import os
-    # Use absolute path relative to this file
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     if os.path.exists(data_dir):
         for filename in os.listdir(data_dir):
-            if filename.endswith(".parquet") or filename.endswith(".csv"):
-                try:
-                    file_path = os.path.join(data_dir, filename)
-                    if filename.endswith(".parquet"):
-                        df = pd.read_parquet(file_path)
-                    else:
-                        df = pd.read_csv(file_path)
-                    
-                    df.columns = [c.strip() for c in df.columns]
-                    
-                    # Try to get Master ID from filename
-                    master_id = extract_master_id_from_filename(filename)
-                    if master_id:
-                        df['Master ID'] = master_id
-                    else:
-                        df['Master ID'] = None
-                        
-                    dfs.append(df)
-                except Exception as e:
-                    print(f"Error loading local file {filename}: {e}")
-            
-    if not dfs:
-        # Create empty DataFrame with expected columns to prevent Catalog Error
-        columns = [
-            "Event ID", "Event Name", "Event Date", "Race Type", "Name", "Gender", "Age", 
-            "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank", 
-            "Gender Rank", "Division Rank", "Status", "Master ID"
-        ]
-        full_df = pd.DataFrame(columns=columns)
-    else:
-        # Concatenate all dataframes
+            if not (filename.endswith(".parquet") or filename.endswith(".csv")):
+                continue
+            try:
+                file_path = os.path.join(data_dir, filename)
+                if filename.endswith(".parquet"):
+                    df = pd.read_parquet(file_path)
+                else:
+                    df = pd.read_csv(file_path)
+                df.columns = [c.strip() for c in df.columns]
+                df['Master ID'] = extract_master_id_from_filename(filename)
+                dfs.append(df)
+            except Exception as e:
+                print(f"Error loading local file {filename}: {e}")
+
+    if dfs:
         full_df = pd.concat(dfs, ignore_index=True)
-        
-    # Register as a DuckDB table
-    # Register as a DuckDB table
-    con.register('results', full_df)
-    
-    return con
+    else:
+        # Empty frame with the expected columns so views can still be created.
+        full_df = pd.DataFrame(columns=RESULT_COLUMNS)
 
+    return init_db_from_dataframe(full_df)
 
-import json
-import os
 
 def get_metadata_path():
     return os.path.join(os.path.dirname(__file__), "data", "event_metadata.json")
