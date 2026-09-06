@@ -74,3 +74,66 @@ def test_fetch_master_events_returns_empty_list_on_failure():
     session = FakeSession([FakeResponse({}, status_code=503)])
 
     assert core.fetch_master_events("15776", session=session) == []
+
+
+def page(n_results):
+    """One results page with n_results runners in a single 5K interval."""
+    return [
+        {
+            "race": {"name": "5K"},
+            "intervals": [
+                {
+                    "distance": {"meters": 5000},
+                    "results": [{"displayName": f"R{i}", "chipTimeInMillis": 1_200_000} for i in range(n_results)],
+                }
+            ],
+        }
+    ]
+
+
+def test_fetch_results_pages_until_empty(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(core.time, "sleep", lambda s: sleeps.append(s))
+    session = FakeSession([FakeResponse(page(100)), FakeResponse(page(7)), FakeResponse(page(0))])
+
+    blocks = core.fetch_results("994637", session=session)
+
+    # Two non-empty pages were kept; the empty page terminated the loop.
+    assert len(blocks) == 3  # 3 raw blocks were returned (incl. the empty one); parse_results ignores empties
+    assert [c[1]["from"] for c in session.calls] == [0, 100, 200]
+    assert all(c[1]["limit"] == 100 for c in session.calls)
+    assert all(c[2] == core.DEFAULT_TIMEOUT for c in session.calls)
+    # We paused between pages, but not after the final (empty) page.
+    assert sleeps == [core.REQUEST_DELAY_SECONDS, core.REQUEST_DELAY_SECONDS]
+
+
+def test_fetch_results_raises_instead_of_returning_partial(monkeypatch):
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    session = FakeSession([FakeResponse(page(100)), FakeResponse({}, status_code=502)])
+
+    with pytest.raises(requests.HTTPError):
+        core.fetch_results("994637", session=session)
+
+
+def test_fetch_results_stops_at_max_pages(monkeypatch):
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    monkeypatch.setattr(core, "MAX_PAGES", 3)
+    # Every page is non-empty; without the cap this would loop forever.
+    session = FakeSession([FakeResponse(page(100)) for _ in range(10)])
+
+    blocks = core.fetch_results("994637", session=session)
+
+    assert len(session.calls) == 3
+    assert len(blocks) == 3
+
+
+def test_get_results_returns_dataframe(monkeypatch):
+    monkeypatch.setattr(core.time, "sleep", lambda s: None)
+    meta = {"id": 994637, "name": "Test Trot", "start": {"epoch": 1669291200000}}
+    session = FakeSession([FakeResponse(meta), FakeResponse(page(2)), FakeResponse(page(0))])
+
+    df = core.get_results("994637", session=session)
+
+    assert list(df["Name"]) == ["R0", "R1"]
+    assert df["Event Name"].iloc[0] == "Test Trot"
+    assert df["Time"].iloc[0] == "20:00"

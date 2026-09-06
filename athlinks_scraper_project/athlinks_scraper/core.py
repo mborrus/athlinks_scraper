@@ -130,61 +130,47 @@ def fetch_metadata(event_id, session=None):
         print(f"Warning: Could not fetch metadata: {e}")
         return {}
 
-def fetch_results(event_id):
+def fetch_results(event_id, session=None):
     """
-    Fetches all results for the given event ID from the Athlinks API.
-    Handles pagination automatically.
-    Returns the raw list of course objects.
+    Fetches all results for the given event ID from the Athlinks API,
+    following pagination until a page contains zero results.
+
+    Returns the raw list of "course" blocks exactly as the API returned them
+    (parse_results flattens them). Pauses REQUEST_DELAY_SECONDS between pages
+    and stops after MAX_PAGES as a safety net.
+
+    Raises requests.RequestException if any page cannot be fetched, so callers
+    never receive a silently-truncated result set.
     """
     base_url = f"https://reignite-api.athlinks.com/event/{event_id}/results"
-    # We need to store the raw course objects to preserve the structure
-    # But pagination might return partial course objects?
-    # Let's accumulate the 'intervals' -> 'results' into a structure we can parse later.
-    # Actually, to keep it simple, let's just return a flat list of enriched result dicts here?
-    # No, separation of concerns. Let's return the raw data blocks.
-    
-    # Issue: The API returns a list of courses. Pagination likely appends results to the 'results' list inside the intervals.
-    # If we just append the whole response objects, we might duplicate course metadata but that's fine.
-    # We will parse it all together.
-    
-    all_data_blocks = []
     limit = 100
     from_index = 0
-    
+    all_data_blocks = []
+
     print(f"Fetching results for Event ID: {event_id}...")
-    
-    while True:
-        params = {
-            "correlationId": "",
-            "from": from_index,
-            "limit": limit
-        }
-        
-        try:
-            response = requests.get(base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching data: {e}")
-            break
-            
+
+    for page_number in range(MAX_PAGES):
+        params = {"correlationId": "", "from": from_index, "limit": limit}
+        data = fetch_json(base_url, params=params, session=session)
+
         batch_results_count = 0
-        
         if isinstance(data, list):
-            all_data_blocks.extend(data) # Store the raw blocks
+            all_data_blocks.extend(data)
             for course in data:
-                if 'intervals' in course:
-                    for interval in course['intervals']:
-                        if 'results' in interval:
-                            batch_results_count += len(interval['results'])
-        
+                for interval in course.get('intervals', []):
+                    batch_results_count += len(interval.get('results', []))
+
         print(f"Fetched {batch_results_count} results")
-        
+
         if batch_results_count == 0:
             break
-            
+
         from_index += limit
-        
+        if page_number + 1 < MAX_PAGES:
+            time.sleep(REQUEST_DELAY_SECONDS)
+    else:
+        print(f"Warning: stopped after {MAX_PAGES} pages; results may be incomplete.")
+
     return all_data_blocks
 
 def parse_results(data_blocks, metadata=None):
@@ -273,16 +259,16 @@ def results_to_df(data_blocks, metadata=None):
     df = pd.DataFrame(parsed)
     return df
 
-def get_results(url_or_id):
+def get_results(url_or_id, session=None):
     """
     Main entry point. Takes a URL or Event ID, fetches results, and returns a DataFrame.
+    Raises requests.RequestException if the results cannot be fetched.
     """
     if str(url_or_id).isdigit():
         event_id = url_or_id
     else:
         event_id = extract_event_id(url_or_id)
-        
-    metadata = fetch_metadata(event_id)
-    raw_data = fetch_results(event_id)
-    df = results_to_df(raw_data, metadata)
-    return df
+
+    metadata = fetch_metadata(event_id, session=session)
+    raw_data = fetch_results(event_id, session=session)
+    return results_to_df(raw_data, metadata)
