@@ -1,8 +1,63 @@
+import time
 import requests
 import pandas as pd
 import re
 from datetime import datetime
 from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# --- HTTP configuration ---------------------------------------------------
+# Seconds to wait for the Athlinks API before giving up on one request.
+DEFAULT_TIMEOUT = 15
+# Seconds to pause between paginated results requests so we don't hammer the API.
+REQUEST_DELAY_SECONDS = 0.5
+# Hard cap on results pages per event (100 results/page -> 50,000 results).
+MAX_PAGES = 500
+
+_SESSION = None
+
+
+def build_session():
+    """
+    Creates a requests.Session that automatically retries transient failures.
+
+    Retries up to 3 times on connection errors and on 429/500/502/503/504
+    responses, sleeping 1s, 2s, 4s between attempts (backoff_factor=1).
+    """
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def get_session():
+    """Returns the shared module-level session, creating it on first use."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = build_session()
+    return _SESSION
+
+
+def fetch_json(url, params=None, session=None, timeout=DEFAULT_TIMEOUT):
+    """
+    GETs `url` and returns the parsed JSON body.
+
+    Raises requests.RequestException (or a subclass such as HTTPError) if the
+    request ultimately fails after retries. Callers decide whether that is fatal.
+    """
+    session = session or get_session()
+    response = session.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
 
 def extract_event_id(url):
     """
@@ -36,46 +91,42 @@ def extract_master_id(url):
         return match.group(1)
     return None
 
-def fetch_master_events(master_id):
+def fetch_master_events(master_id, session=None):
     """
     Fetches all child events for a given master event ID.
-    Returns a list of event objects (id, name, date).
+    Returns a list of event dicts (id, name, date, date_str), newest first.
+    Returns [] if the request fails.
     """
     url = f"https://reignite-api.athlinks.com/master/{master_id}/metadata"
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        
-        events = []
-        # The 'events' list in the JSON contains the child events
-        for event in data.get('events', []):
-            # Extract relevant info
-            events.append({
-                'id': event.get('id'),
-                'name': event.get('name'),
-                'date': event.get('start', {}).get('epoch'), # Timestamp
-                'date_str': pd.to_datetime(event.get('start', {}).get('epoch'), unit='ms').strftime('%Y-%m-%d') if event.get('start', {}).get('epoch') else 'Unknown'
-            })
-            
-        # Sort by date descending (newest first)
-        events.sort(key=lambda x: x['date'] or 0, reverse=True)
-        return events
-        
-    except Exception as e:
+        data = fetch_json(url, session=session)
+    except requests.RequestException as e:
         print(f"Error fetching master events: {e}")
         return []
 
-def fetch_metadata(event_id):
+    events = []
+    for event in data.get('events', []):
+        epoch = (event.get('start') or {}).get('epoch')
+        events.append({
+            'id': event.get('id'),
+            'name': event.get('name'),
+            'date': epoch,
+            'date_str': pd.to_datetime(epoch, unit='ms').strftime('%Y-%m-%d') if epoch else 'Unknown',
+        })
+
+    # Sort by date descending (newest first)
+    events.sort(key=lambda x: x['date'] or 0, reverse=True)
+    return events
+
+def fetch_metadata(event_id, session=None):
     """
-    Fetches event metadata (Name, Date, etc.)
+    Fetches event metadata (name, date, etc.). Returns {} if the request fails,
+    because metadata is optional enrichment and should not abort a scrape.
     """
     url = f"https://reignite-api.athlinks.com/event/{event_id}/metadata"
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
+        return fetch_json(url, session=session)
+    except requests.RequestException as e:
         print(f"Warning: Could not fetch metadata: {e}")
         return {}
 
