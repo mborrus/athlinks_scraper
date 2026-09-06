@@ -130,80 +130,65 @@ def get_event_names(con):
 
 def create_enriched_view(con, selected_master_id=None):
     """
-    Creates or replaces the results_enriched view.
-    If selected_master_id is provided, filters data to that Master ID.
+    Creates or replaces the results_enriched view with parsed seconds, year,
+    normalized name and normalized race type. Drops DNFs and impossible times.
+    If selected_master_id is given, only that master event is included.
+
+    selected_master_id must be all digits. DuckDB cannot bind parameters
+    inside CREATE VIEW, so we validate instead of interpolating blindly.
     """
-    
-    # Base filter conditions
+    # Reusable "MM:SS" / "HH:MM:SS" -> integer seconds parser.
+    con.execute("""
+        CREATE OR REPLACE MACRO to_seconds(txt) AS
+            CASE
+                WHEN txt LIKE '%:%:%' THEN
+                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS INTEGER) * 3600 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS INTEGER) * 60 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 3) AS INTEGER)
+                WHEN txt LIKE '%:%' THEN
+                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS INTEGER) * 60 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS INTEGER)
+                ELSE NULL
+            END
+    """)
+
     where_clause = """
         "Pace" IS NOT NULL AND "Pace" != ''
         AND "Time" IS NOT NULL
-        
-        -- Filter out anyone faster than 12:00 (720 seconds).
-        AND (
-            CASE 
-                WHEN "Time" LIKE '%:%:%' THEN 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 3600 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 3) AS INTEGER)
-                ELSE 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER)
-            END
-        ) > 720
+        -- Anyone faster than 12:00 (720 s) is a timing error, not a 5K finisher.
+        AND to_seconds("Time") > 720
         -- Exclude DNF (Did Not Finish)
         AND ("Status" IS NULL OR "Status" != 'DNF')
     """
-    
-    # Add Master ID Filter if selected
-    if selected_master_id:
-        where_clause += f" AND \"Master ID\" = '{selected_master_id}'"
 
-    query = f"""
+    if selected_master_id is not None:
+        master_id_str = str(selected_master_id)
+        if not master_id_str.isdigit():
+            raise ValueError(f"Master ID must be numeric, got {selected_master_id!r}")
+        where_clause += f" AND \"Master ID\" = '{master_id_str}'"
+
+    con.execute(f"""
         CREATE OR REPLACE VIEW results_enriched AS
         SELECT *,
-             -- 1. Parse Pace to Seconds
-             CASE 
-                WHEN "Pace" LIKE '%:%:%' THEN 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 1) AS INTEGER) * 3600 + 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 2) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 3) AS INTEGER)
-                ELSE 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 1) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 2) AS INTEGER)
-             END as pace_seconds,
-
-             -- 2. Parse Time to Seconds
-             CASE 
-                WHEN "Time" LIKE '%:%:%' THEN 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 3600 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 3) AS INTEGER)
-                ELSE 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER)
-             END as time_seconds,
-             
+             to_seconds("Pace") as pace_seconds,
+             to_seconds("Time") as time_seconds,
              YEAR(CAST("Event Date" AS DATE)) as event_year,
-             
-             -- 3. Normalize Name
-             CASE 
+
+             -- Normalize Name (one known data-entry fix kept from the original)
+             CASE
                 WHEN TRIM(UPPER("Name")) = 'NESBITT DREW' THEN 'DREW NESBITT'
                 ELSE TRIM(UPPER("Name"))
              END as "Name_Normalized",
 
-             -- 4. Normalize Race Type (Catch variations of 5k and 5 Mile)
-             CASE 
+             -- Normalize Race Type (catch variations of 5k and 5 Mile)
+             CASE
                 WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5k([- ]?run)?$') THEN '5K'
                 WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5[- ]?mil(e|er)([- ]?run)?$') THEN '5 Mile'
                 ELSE "Race Type"
              END as "Race Type Normalized"
-
         FROM results
         WHERE {where_clause}
-    """
-    
-    con.execute(query)
+    """)
 
 def get_overview_stats(con):
     """
@@ -618,34 +603,32 @@ def get_raw_times(con):
 
 def get_competitiveness_stats(con, gender="All", age_min=0, age_max=100):
     """
-    Returns the 3rd and 10th place times by year, filtered by demographics.
+    Returns the 3rd and 10th place finish times (seconds) by year for the
+    primary race, filtered by gender ("All", "M" or "F") and age range.
     """
     try:
-        # Build Filter Clause
-        filters = []
+        params = [age_min, age_max]
+        gender_clause = ""
         if gender != "All":
-            filters.append(f"\"Gender\" = '{gender}'")
-        
-        filters.append(f"\"Age\" BETWEEN {age_min} AND {age_max}")
-        
-        where_clause = " AND ".join(filters)
-        if where_clause:
-            where_clause = "AND " + where_clause
+            gender_clause = 'AND "Gender" = ?'
+            params.append(gender)
 
         query = f"""
             WITH primary_race AS (
-                SELECT "Race Type Normalized" FROM results_enriched GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+                SELECT "Race Type Normalized" FROM results_enriched
+                GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
             ),
             ranked AS (
-                SELECT 
+                SELECT
                     event_year,
                     time_seconds,
                     ROW_NUMBER() OVER (PARTITION BY event_year ORDER BY time_seconds ASC) as rn
                 FROM results_enriched
                 WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
-                  {where_clause}
+                  AND "Age" BETWEEN ? AND ?
+                  {gender_clause}
             )
-            SELECT 
+            SELECT
                 event_year,
                 MAX(CASE WHEN rn = 3 THEN time_seconds END) as time_top_3,
                 MAX(CASE WHEN rn = 10 THEN time_seconds END) as time_top_10
@@ -654,7 +637,7 @@ def get_competitiveness_stats(con, gender="All", age_min=0, age_max=100):
             GROUP BY event_year
             ORDER BY event_year
         """
-        return con.execute(query).df()
+        return con.execute(query, params).df()
     except Exception as e:
         print(f"Error getting competitiveness stats: {e}")
         return pd.DataFrame()
