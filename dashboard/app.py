@@ -8,7 +8,6 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'athlinks_scraper_project'))
 
 from athlinks_scraper.core import get_results, extract_master_id, extract_event_id, fetch_master_events, fetch_metadata
-from athlinks_scraper.core import get_results, extract_master_id, extract_event_id, fetch_master_events, fetch_metadata
 from dashboard_queries import init_db, get_event_names, create_enriched_view, get_overview_stats, get_pace_partners, get_fun_stats, get_distribution, get_trends, get_runner_history, get_nemesis, get_retention_data, get_fastest_by_year, get_fastest_by_demographics, get_division_stats, get_era_stats, get_raw_times, get_avg_annual_runners, save_custom_event_name, get_competitiveness_stats
 import plotly.graph_objects as go
 
@@ -180,21 +179,32 @@ with st.sidebar:
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         
+                        failed_years = []
                         for i, event in enumerate(events):
                             year = event['date_str'][:4]
                             event_id = event['id']
                             status_text.text(f"Scraping {year}...")
-                            
-                            df = get_results(event_id)
+
+                            try:
+                                df = get_results(event_id)
+                            except Exception as year_error:
+                                # One bad year must not abort the rest of the scrape.
+                                failed_years.append(year)
+                                st.warning(f"Skipped {year}: {year_error}")
+                                df = pd.DataFrame()
+
                             if not df.empty:
                                 # Save to data/
                                 filename = os.path.join(os.path.dirname(__file__), "data", f"scraped_{master_id}_{year}.parquet")
                                 os.makedirs(os.path.dirname(filename), exist_ok=True)
                                 df.to_parquet(filename, index=False)
-                            
+
                             progress_bar.progress((i + 1) / len(events))
-                        
-                        st.success("Scraping Complete! Refreshing...")
+
+                        if failed_years:
+                            st.warning(f"Finished with errors. Could not scrape: {', '.join(failed_years)}")
+                        else:
+                            st.success("Scraping Complete! Refreshing...")
                         st.rerun()
                     else:
                         st.error("Could not extract Master ID from URL.")
@@ -286,12 +296,20 @@ with tab1:
         # LAYOUT: Magazine Cards
         col1, col2, col3, col4 = st.columns(4)
         
+        first_year = stats["first_year"][0]
+        fastest_year = stats["fastest_year"][0]
+        first_year_txt = f"since {int(first_year)}" if pd.notna(first_year) else "over the years"
+        record_txt = (
+            f"Course record set in {int(fastest_year)} by {fastest_runner}"
+            if pd.notna(fastest_year) else f"Course record held by {fastest_runner}"
+        )
+
         with col1:
-            display_magazine_card("Total Runners", f"{total:,}", "A growing tradition since 2010", "#2563EB")
+            display_magazine_card("Total Runners", f"{total:,}", f"A growing tradition {first_year_txt}", "#2563EB")
         with col2:
             display_magazine_card("Average Pace", avg_pace_fmt, "Steady pace despite growth", "#10B981")
         with col3:
-            display_magazine_card("Fastest Time", fastest, f"Course record set in 2019 by {fastest_runner}", "#F59E0B")
+            display_magazine_card("Fastest Time", fastest, record_txt, "#F59E0B")
         with col4:
             display_magazine_card("Slowest Time", slowest, "Every finisher counts", "#EF4444")
             
@@ -320,7 +338,6 @@ with tab1:
                 "p95_pace_seconds": "Slowest Pace (95th %)",
                 "median_pace_seconds": "Median Pace"
             }
-            tick_format = "%M:%S"
             tick_format = "%M:%S"
             # Filter out extreme outliers (> 45 min/mile) for better auto-ranging
             # 45 mins = 2700 seconds
@@ -518,7 +535,6 @@ with tab1:
             # Depth Chart
             fig_depth = px.bar(div_stats, x="Age_Group", y="runner_count", title="Field Depth by Division",
                                color_discrete_sequence=["#2563EB"])
-            fig_depth.update_layout(xaxis_title="Age Group", yaxis_title="Runner Count")
             fig_depth.update_layout(xaxis_title="Age Group", yaxis_title="Runner Count")
             display_chart(fig_depth)
             
