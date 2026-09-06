@@ -36,9 +36,12 @@ def render(con):
     plot = yearly.copy()
     plot["Runner"] = pd.to_datetime(plot["time_seconds"], unit="s")
     plot["Field median"] = pd.to_datetime(plot["median_seconds"], unit="s")
+    # value_name can't be "Time" here: plot still carries the original "Time"
+    # string column (used above and in the table below), and pandas rejects
+    # a value_name that collides with any existing column on the frame.
     melted = plot.melt(id_vars=["event_year"], value_vars=["Runner", "Field median"],
-                       var_name="Series", value_name="Time")
-    fig = px.line(melted, x="event_year", y="Time", color="Series", markers=True,
+                       var_name="Series", value_name="Finish Time")
+    fig = px.line(melted, x="event_year", y="Finish Time", color="Series", markers=True,
                   title=f"{name.title()} vs the field",
                   color_discrete_map={"Runner": theme.PALETTE["accent"], "Field median": theme.PALETTE["muted"]})
     fig.update_layout(yaxis_tickformat="%M:%S", xaxis_title="Edition", yaxis_title="Finish time")

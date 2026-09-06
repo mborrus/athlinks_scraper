@@ -25,31 +25,31 @@ def masthead(title, dateline, intro=None):
 
 
 def section(title, kicker=None):
-    kicker_html = f'<div class="rp-kicker">{_esc(kicker)}</div>' if kicker else ""
-    st.markdown(
-        f"""
-        <div class="rp-section">
-            {kicker_html}
-            <div class="rp-section-title">{_esc(title)}</div>
-            <hr class="rp-section-rule"/>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Built as a single joined string (no blank/whitespace-only lines): a
+    # blank line inside an unsafe_allow_html block ends the HTML block early
+    # per CommonMark, leaving the rest to render as a literal indented code
+    # block. That happens here whenever kicker is omitted and its line would
+    # otherwise be empty.
+    parts = ['<div class="rp-section">']
+    if kicker:
+        parts.append(f'<div class="rp-kicker">{_esc(kicker)}</div>')
+    parts.append(f'<div class="rp-section-title">{_esc(title)}</div>')
+    parts.append('<hr class="rp-section-rule"/>')
+    parts.append("</div>")
+    st.markdown("\n".join(parts), unsafe_allow_html=True)
 
 
 def stat_tile(label, value, note=None):
-    note_html = f'<div class="rp-tile-note">{_esc(note)}</div>' if note else ""
-    st.markdown(
-        f"""
-        <div class="rp-tile">
-            <div class="rp-tile-label">{_esc(label)}</div>
-            <div class="rp-tile-value">{_esc(value)}</div>
-            {note_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # See the note in section() above: no blank lines when note is omitted.
+    parts = [
+        '<div class="rp-tile">',
+        f'<div class="rp-tile-label">{_esc(label)}</div>',
+        f'<div class="rp-tile-value">{_esc(value)}</div>',
+    ]
+    if note:
+        parts.append(f'<div class="rp-tile-note">{_esc(note)}</div>')
+    parts.append("</div>")
+    st.markdown("\n".join(parts), unsafe_allow_html=True)
 
 
 def stat_row(items):
