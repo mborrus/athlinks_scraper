@@ -1,0 +1,5 @@
+# Development / test dependencies. Install from the repo root:
+#   pip install -r requirements-dev.txt
+pytest>=6.2
+-r dashboard/requirements.txt
+-e athlinks_scraper_project
