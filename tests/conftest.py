@@ -19,21 +19,21 @@ import pandas as pd
 import pytest
 
 COLUMNS = [
-    "Event ID", "Event Name", "Event Date", "Race Type", "Name", "Gender", "Age",
-    "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
-    "Gender Rank", "Division Rank", "Status", "Master ID",
+    "Source", "Race Group", "Event ID", "Event Name", "Event Date", "Race Type", "Name",
+    "Gender", "Age", "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
+    "Gender Rank", "Division Rank", "Status",
 ]
 
 
 def _row(event_date, name, gender, age, time_str, pace_str, rank, status="CONF",
-         master_id="111", event_name="Test Trot", race_type="5K"):
+         group="111", event_name="Test Trot", race_type="5K"):
     return {
         "Event ID": "1", "Event Name": event_name, "Event Date": event_date,
         "Race Type": race_type, "Name": name, "Gender": gender, "Age": age,
         "Bib": str(rank), "City": "Branford", "State": "CT", "Country": "USA",
         "Time": time_str, "Pace": pace_str, "Overall Rank": rank,
         "Gender Rank": rank, "Division Rank": rank, "Status": status,
-        "Master ID": master_id,
+        "Source": "athlinks", "Race Group": group,
     }
 
 
@@ -58,7 +58,7 @@ def sample_results_df():
         _row("2023-11-23", "Carol Slow", "F", 61, "31:00", "9:59", 4),   # KEEP
         # --- a different event, must be filtered out by master id ---
         _row("2023-11-23", "Zed Other", "M", 40, "22:00", "7:05", 1,
-             master_id="222", event_name="Other Trot"),
+             group="222", event_name="Other Trot"),
     ]
     return pd.DataFrame(rows, columns=COLUMNS)
 

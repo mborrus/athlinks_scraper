@@ -30,11 +30,18 @@ def test_enriched_view_parses_seconds_and_year(db):
     assert row == (17 * 60 + 30, 5 * 60 + 38, 2023)
 
 
-def test_create_enriched_view_rejects_non_numeric_master_id(sample_results_df):
+def test_create_enriched_view_rejects_unsafe_group_key(sample_results_df):
     con = dq.init_db_from_dataframe(sample_results_df)
 
     with pytest.raises(ValueError):
         dq.create_enriched_view(con, "111' OR '1'='1")
+
+
+def test_create_enriched_view_accepts_slug_group_key(sample_results_df):
+    con = dq.init_db_from_dataframe(sample_results_df)
+    dq.create_enriched_view(con, "frosty-5k")  # valid slug, simply matches nothing here
+
+    assert con.execute("SELECT COUNT(*) FROM results_enriched").fetchone()[0] == 0
 
 
 def test_create_enriched_view_accepts_integer_master_id(sample_results_df):

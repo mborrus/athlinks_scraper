@@ -6,12 +6,14 @@ import re
 import duckdb
 import pandas as pd
 
+from athlinks_scraper.providers.naming import race_group_label
+
 # Dashboard Queries Module
 
 RESULT_COLUMNS = [
-    "Event ID", "Event Name", "Event Date", "Race Type", "Name", "Gender", "Age",
-    "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
-    "Gender Rank", "Division Rank", "Status", "Master ID",
+    "Source", "Race Group", "Event ID", "Event Name", "Event Date", "Race Type", "Name",
+    "Gender", "Age", "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
+    "Gender Rank", "Division Rank", "Status",
 ]
 
 
@@ -38,6 +40,22 @@ def extract_master_id_from_filename(filename):
     return None
 
 
+def backfill_legacy_columns(df, filename):
+    """
+    Files written before multi-source support have a 'Master ID' column (or
+    only the master id in the filename) and no 'Source'/'Race Group'. Fill
+    them in so old and new files share one schema.
+    """
+    if "Race Group" not in df.columns:
+        if "Master ID" in df.columns:
+            df["Race Group"] = df["Master ID"].astype(str)
+        else:
+            df["Race Group"] = extract_master_id_from_filename(filename)
+    if "Source" not in df.columns:
+        df["Source"] = "athlinks"
+    return df
+
+
 def init_db_from_dataframe(df):
     """
     Creates an in-memory DuckDB connection with `df` registered as the
@@ -59,7 +77,7 @@ def init_db(uploaded_files):
         try:
             df = pd.read_csv(uploaded_file)
             df.columns = [c.strip() for c in df.columns]
-            df['Master ID'] = extract_master_id_from_filename(uploaded_file.name)
+            df = backfill_legacy_columns(df, uploaded_file.name)
             dfs.append(df)
         except Exception as e:
             print(f"Error loading {uploaded_file.name}: {e}")
@@ -76,7 +94,7 @@ def init_db(uploaded_files):
                 else:
                     df = pd.read_csv(file_path)
                 df.columns = [c.strip() for c in df.columns]
-                df['Master ID'] = extract_master_id_from_filename(filename)
+                df = backfill_legacy_columns(df, filename)
                 dfs.append(df)
             except Exception as e:
                 print(f"Error loading local file {filename}: {e}")
@@ -114,91 +132,87 @@ def save_custom_event_name(master_id, new_name):
 
 def get_event_names(con):
     """
-    Returns a list of dictionaries with 'master_id' and 'display_name'.
-    Groups by Master ID and picks the most recent Event Name, 
-    overridden by custom names if available.
+    One entry per Race Group: {'group_key', 'display_name', 'source_name', 'n_years'}.
+    display_name is the year-stripped event name, overridden by event_metadata.json.
     """
     try:
-        # Get distinct Master IDs and their most recent Event Name
-        query = """
-            SELECT 
-                "Master ID" as master_id,
-                FIRST("Event Name") as display_name
-            FROM results 
-            WHERE "Master ID" IS NOT NULL
-            GROUP BY "Master ID"
-            ORDER BY display_name ASC
-        """
-        df = con.execute(query).df()
-        events = df.to_dict('records')
-        
-        # Apply custom overrides
-        metadata = load_event_metadata()
-        for event in events:
-            mid = str(event['master_id'])
-            if mid in metadata:
-                event['display_name'] = metadata[mid]
-                
-        return events
+        df = con.execute("""
+            SELECT
+                "Race Group" AS group_key,
+                FIRST("Event Name") AS event_name,
+                FIRST("Source") AS source_name,
+                COUNT(DISTINCT YEAR(TRY_CAST("Event Date" AS DATE))) AS n_years
+            FROM results
+            WHERE "Race Group" IS NOT NULL
+            GROUP BY "Race Group"
+            ORDER BY event_name ASC
+        """).df()
+        overrides = load_event_metadata()
+        groups = []
+        for rec in df.to_dict('records'):
+            key = str(rec["group_key"])
+            groups.append({
+                "group_key": key,
+                "display_name": overrides.get(key) or race_group_label(rec["event_name"] or key),
+                "source_name": rec["source_name"],
+                "n_years": int(rec["n_years"]),
+            })
+        groups.sort(key=lambda g: g["display_name"].lower())
+        return groups
     except Exception as e:
         print(f"Error getting event names: {e}")
         return []
 
-def create_enriched_view(con, selected_master_id=None):
+
+def create_enriched_view(con, selected_group=None):
     """
     Creates or replaces the results_enriched view with parsed seconds, year,
     normalized name and normalized race type. Drops DNFs and impossible times.
-    If selected_master_id is given, only that master event is included.
+    If selected_group is given, only that Race Group is included.
 
-    selected_master_id must be all digits. DuckDB cannot bind parameters
-    inside CREATE VIEW, so we validate instead of interpolating blindly.
+    DuckDB cannot bind parameters inside CREATE VIEW, so the group key is
+    validated against a strict slug pattern instead.
     """
-    # Reusable "MM:SS" / "HH:MM:SS" -> integer seconds parser.
     con.execute("""
-        CREATE OR REPLACE MACRO to_seconds(txt) AS
+        CREATE OR REPLACE MACRO to_seconds(txt) AS CAST(
             CASE
                 WHEN txt LIKE '%:%:%' THEN
-                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS INTEGER) * 3600 +
-                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS INTEGER) * 60 +
-                    TRY_CAST(SPLIT_PART(txt, ':', 3) AS INTEGER)
+                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS DOUBLE) * 3600 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS DOUBLE) * 60 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 3) AS DOUBLE)
                 WHEN txt LIKE '%:%' THEN
-                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS INTEGER) * 60 +
-                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS INTEGER)
+                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS DOUBLE) * 60 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS DOUBLE)
                 ELSE NULL
-            END
+            END AS INTEGER)
     """)
 
     where_clause = """
         "Pace" IS NOT NULL AND "Pace" != ''
         AND "Time" IS NOT NULL
-        -- Anyone faster than 12:00 (720 s) is a timing error, not a 5K finisher.
+        -- Anyone faster than 12:00 (720 s) is a timing error, not a finisher.
         AND to_seconds("Time") > 720
-        -- Exclude DNF (Did Not Finish)
         AND ("Status" IS NULL OR "Status" != 'DNF')
     """
 
-    if selected_master_id is not None:
-        master_id_str = str(selected_master_id)
-        if not master_id_str.isdigit():
-            raise ValueError(f"Master ID must be numeric, got {selected_master_id!r}")
-        where_clause += f" AND \"Master ID\" = '{master_id_str}'"
+    if selected_group is not None:
+        key = str(selected_group)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            raise ValueError(f"Race Group key contains unsafe characters: {selected_group!r}")
+        where_clause += f" AND \"Race Group\" = '{key}'"
 
     con.execute(f"""
         CREATE OR REPLACE VIEW results_enriched AS
         SELECT *,
              to_seconds("Pace") as pace_seconds,
              to_seconds("Time") as time_seconds,
-             YEAR(CAST("Event Date" AS DATE)) as event_year,
-
-             -- Normalize Name (one known data-entry fix kept from the original)
+             YEAR(TRY_CAST("Event Date" AS DATE)) as event_year,
              CASE
                 WHEN TRIM(UPPER("Name")) = 'NESBITT DREW' THEN 'DREW NESBITT'
                 ELSE TRIM(UPPER("Name"))
              END as "Name_Normalized",
-
-             -- Normalize Race Type (catch variations of 5k and 5 Mile)
              CASE
-                WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5k([- ]?run)?$') THEN '5K'
+                WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5k([- ]?(run|walk|run/walk))?$') THEN '5K'
                 WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5[- ]?mil(e|er)([- ]?run)?$') THEN '5 Mile'
                 ELSE "Race Type"
              END as "Race Type Normalized"
@@ -405,67 +419,6 @@ def get_nemesis(con, runner_name):
     except Exception as e:
         print(f"Error finding nemesis: {e}")
         return pd.DataFrame()
-
-def get_retention_data(con):
-    """
-    Calculates retention flow between years for Sankey diagram.
-    """
-    try:
-        # Get all years
-        years_df = con.execute("SELECT DISTINCT event_year FROM results_enriched ORDER BY event_year").df()
-        years = years_df['event_year'].tolist()
-        
-        if len(years) < 2:
-            return []
-
-        sankey_data = []
-        
-        for i in range(len(years) - 1):
-            year_current = years[i]
-            year_next = years[i+1]
-            
-            # Get runners in current year
-            current_runners = con.execute(f"SELECT Name_Normalized FROM results_enriched WHERE event_year = {year_current}").df()['Name_Normalized'].tolist()
-            current_set = set(current_runners)
-            
-            # Get runners in next year
-            next_runners = con.execute(f"SELECT Name_Normalized FROM results_enriched WHERE event_year = {year_next}").df()['Name_Normalized'].tolist()
-            next_set = set(next_runners)
-            
-            # Calculate flow
-            retained = len(current_set.intersection(next_set))
-            churned = len(current_set) - retained
-            new_runners = len(next_set) - retained
-            
-            # Source, Target, Value, Label
-            # 1. Retained: Year X -> Year X+1
-            sankey_data.append({
-                "source": str(year_current),
-                "target": str(year_next),
-                "value": retained,
-                "type": "Retained"
-            })
-            
-            # 2. Churned: Year X -> Churned (did not go to X+1)
-            sankey_data.append({
-                "source": str(year_current),
-                "target": f"Left after {year_current}",
-                "value": churned,
-                "type": "Churned"
-            })
-            
-            # 3. New: New -> Year X+1
-            sankey_data.append({
-                "source": f"New in {year_next}",
-                "target": str(year_next),
-                "value": new_runners,
-                "type": "New"
-            })
-            
-        return sankey_data
-    except Exception as e:
-        print(f"Error getting retention data: {e}")
-        return []
 
 def get_fastest_by_year(con):
     """
