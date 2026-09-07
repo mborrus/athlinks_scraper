@@ -7,6 +7,7 @@ import duckdb
 import pandas as pd
 
 from athlinks_scraper.providers.naming import race_group_label
+from storage import backfill_legacy_columns, extract_master_id_from_filename  # noqa: F401  (re-exported)
 
 # Dashboard Queries Module
 
@@ -30,30 +31,6 @@ def format_seconds(total_seconds):
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
-
-
-def extract_master_id_from_filename(filename):
-    """scraped_15776_2023.parquet -> '15776'; anything else -> None."""
-    match = re.search(r'scraped_(\d+)_', filename)
-    if match:
-        return match.group(1)
-    return None
-
-
-def backfill_legacy_columns(df, filename):
-    """
-    Files written before multi-source support have a 'Master ID' column (or
-    only the master id in the filename) and no 'Source'/'Race Group'. Fill
-    them in so old and new files share one schema.
-    """
-    if "Race Group" not in df.columns:
-        if "Master ID" in df.columns:
-            df["Race Group"] = df["Master ID"].astype(str)
-        else:
-            df["Race Group"] = extract_master_id_from_filename(filename)
-    if "Source" not in df.columns:
-        df["Source"] = "athlinks"
-    return df
 
 
 def init_db_from_dataframe(df):
