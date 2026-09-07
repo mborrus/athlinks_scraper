@@ -49,6 +49,15 @@ def load_group_cached(dsn, group_key):
     return storage.load_group(get_store(dsn).cursor(), group_key)
 
 
+def flash(level, text):
+    """
+    Queue a message for the next run. st.rerun() throws away the current
+    render, so anything written before it is never seen; the sidebar pops
+    these on the way back in.
+    """
+    st.session_state.setdefault("flash", []).append((level, text))
+
+
 def invalidate_and_rerun():
     load_group_cached.clear()
     st.rerun()
@@ -57,7 +66,8 @@ def invalidate_and_rerun():
 try:
     store = get_store(DSN)
 except Exception as e:
-    st.error(f"Could not open the results store: {e}")
+    print(f"open_store failed: {e}")
+    st.error("Could not open the results store. Check the app logs for the DuckDB error.")
     st.caption("If this is the hosted app, check the `motherduck` token in the app's Secrets.")
     st.stop()
 
@@ -81,27 +91,34 @@ def scrape_url(url):
             failed.append(f"{ref.name}: {e}")
         progress.progress((i + 1) / len(refs))
     if failed:
-        st.warning("Finished with errors:\n\n" + "\n".join(f"- {f}" for f in failed))
+        flash("warning", "Finished with errors:\n\n" + "\n".join(f"- {f}" for f in failed))
     else:
-        st.success("All editions scraped.")
+        flash("success", "All editions scraped.")
     invalidate_and_rerun()
 
 
 def import_uploads(files):
     cur = store.cursor()
     total = 0
+    failed = False
     for f in files:
         try:
             total += storage.save_frame(cur, pd.read_csv(f), f.name)
         except Exception as e:
-            st.error(f"{f.name}: {e}")
-    st.success(f"Imported {total:,} rows.")
+            failed = True
+            flash("error", f"{f.name}: {e}")
+    if total > 0:
+        flash("success", f"Imported {total:,} rows.")
+    elif not failed:
+        flash("warning", "No rows imported (files had no resolvable race).")
     invalidate_and_rerun()
 
 
 # --- Sidebar -----------------------------------------------------------------
 with st.sidebar:
     st.header("Add a race")
+    for level, text in st.session_state.pop("flash", []):
+        {"success": st.success, "warning": st.warning, "error": st.error}[level](text)
     st.caption("Paste a results URL from athlinks.com, results.nyrr.org or runsignup.com. "
                "Every available year is fetched.")
     if "race_url" not in st.session_state:
