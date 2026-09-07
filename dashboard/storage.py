@@ -10,7 +10,7 @@ Everything here is plain duckdb + pandas. No streamlit imports, ever.
 """
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import duckdb
 import pandas as pd
@@ -184,3 +184,50 @@ def list_groups(con) -> pd.DataFrame:
         GROUP BY "Race Group"
         ORDER BY event_name ASC
     """).df()
+
+
+# --- imports of files (uploads and legacy data dirs) ------------------------------------
+
+def save_frame(con, df: pd.DataFrame, filename: Optional[str] = None) -> int:
+    """
+    Stores a frame that did not come from a provider (a CSV upload or a
+    legacy parquet file). Rows are grouped by (Source, Event ID) and each
+    group replaces its predecessor. A null Event ID falls back to the Race
+    Group so old single-year files still replace cleanly.
+    """
+    if df is None or df.empty:
+        return 0
+    conformed = conform(df, filename)
+    missing = conformed["Event ID"].isna()
+    conformed.loc[missing, "Event ID"] = conformed.loc[missing, "Race Group"]
+    total = 0
+    for (source, event_id), part in conformed.groupby(["Source", "Event ID"], dropna=False, sort=False):
+        if source is None or event_id is None:
+            continue
+        total += _replace_rows(con, str(source), str(event_id), part.reset_index(drop=True))
+    return total
+
+
+def import_files(con, data_dir: str) -> List[Tuple[str, int]]:
+    """
+    Imports every *.parquet / *.csv in data_dir via save_frame. Returns
+    (filename, rows_inserted) per file; -1 means the file could not be read
+    or stored. Never raises for a single bad file.
+    """
+    if not os.path.isdir(data_dir):
+        return []
+    report: List[Tuple[str, int]] = []
+    for filename in sorted(os.listdir(data_dir)):
+        if not filename.endswith((".parquet", ".csv")):
+            continue
+        path = os.path.join(data_dir, filename)
+        try:
+            if filename.endswith(".parquet"):
+                df = pd.read_parquet(path)
+            else:
+                df = pd.read_csv(path)
+            report.append((filename, save_frame(con, df, filename)))
+        except Exception as e:  # one bad file must not stop the import
+            print(f"import_files: {filename}: {e}")
+            report.append((filename, -1))
+    return report

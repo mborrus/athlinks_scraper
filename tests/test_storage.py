@@ -122,3 +122,36 @@ def test_list_groups_counts_distinct_years(store):
     assert int(groups.loc["g1", "n_years"]) == 2
     assert groups.loc["g1", "source_name"] == "athlinks"
     assert groups.loc["g2", "event_name"] == "Trot"
+
+
+def test_save_frame_splits_by_event_and_replaces_each(store):
+    both = pd.concat([_frame(["A"], event_id="e1"), _frame(["B"], event_id="e2")], ignore_index=True)
+    assert storage.save_frame(store, both) == 2
+    storage.save_frame(store, _frame(["A2"], event_id="e1"))
+    names = sorted(r[0] for r in store.execute('SELECT "Name" FROM results').fetchall())
+    assert names == ["A2", "B"]
+
+
+def test_save_frame_uses_race_group_when_event_id_missing(store):
+    legacy = pd.DataFrame([{"Master ID": "15776", "Name": "Old", "Time": "20:00",
+                            "Event Date": "2019-11-28", "Event Name": "Trot"}])
+    storage.save_frame(store, legacy, filename="scraped_15776_2019.parquet")
+    row = store.execute('SELECT "Source", "Race Group", "Event ID" FROM results').fetchone()
+    assert row == ("athlinks", "15776", "15776")
+
+
+def test_import_files_reads_parquet_and_csv_and_isolates_failures(store, tmp_path):
+    _frame(["P"], event_id="p").to_parquet(tmp_path / "scraped_athlinks_g1_2023_p.parquet", index=False)
+    _frame(["C"], event_id="c").to_csv(tmp_path / "upload.csv", index=False)
+    (tmp_path / "broken.parquet").write_bytes(b"not a parquet file")
+    (tmp_path / "ignore.txt").write_text("x")
+    report = dict(storage.import_files(store, str(tmp_path)))
+    assert report["scraped_athlinks_g1_2023_p.parquet"] == 1
+    assert report["upload.csv"] == 1
+    assert report["broken.parquet"] == -1
+    assert "ignore.txt" not in report
+    assert store.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 2
+
+
+def test_import_files_missing_dir_returns_empty(store, tmp_path):
+    assert storage.import_files(store, str(tmp_path / "nope")) == []
