@@ -252,3 +252,35 @@ def save_custom_event_name(con, group_key: str, display_name: str) -> None:
         "INSERT OR REPLACE INTO event_metadata (race_group, display_name) VALUES (?, ?)",
         [str(group_key), display_name.strip()],
     )
+
+
+# --- DSN resolution ----------------------------------------------------------------
+
+DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+LOCAL_DB_FILENAME = "results.duckdb"
+
+
+def _clean(value) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def resolve_dsn(secrets=None, env=None, data_dir: Optional[str] = None) -> str:
+    """
+    Picks the store: a MotherDuck token from secrets["motherduck"]["token"],
+    else from env["MOTHERDUCK_TOKEN"], else a local DuckDB file under data_dir.
+    Pure function: pass plain dicts so it needs no streamlit to test.
+    """
+    secrets = secrets or {}
+    env = env or {}
+    token = None
+    md = secrets.get("motherduck") if hasattr(secrets, "get") else None
+    if md is not None and hasattr(md, "get"):
+        token = _clean(md.get("token"))
+    if token is None:
+        token = _clean(env.get("MOTHERDUCK_TOKEN"))
+    if token:
+        return f"md:?motherduck_token={token}"
+    return os.path.join(data_dir or DEFAULT_DATA_DIR, LOCAL_DB_FILENAME)

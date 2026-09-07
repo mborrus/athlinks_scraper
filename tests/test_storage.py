@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -190,3 +192,24 @@ def test_get_event_names_reads_store_and_honours_override(store):
 def test_file_based_loaders_are_gone():
     for name in ("init_db", "get_metadata_path"):
         assert not hasattr(dq, name), name
+
+
+def test_resolve_dsn_prefers_secrets_then_env_then_local_file(tmp_path):
+    secrets = {"motherduck": {"token": "SECRET"}}
+    env = {"MOTHERDUCK_TOKEN": "ENV"}
+    assert storage.resolve_dsn(secrets=secrets, env=env) == "md:?motherduck_token=SECRET"
+    assert storage.resolve_dsn(secrets={}, env=env) == "md:?motherduck_token=ENV"
+    local = storage.resolve_dsn(secrets={}, env={}, data_dir=str(tmp_path))
+    assert local == str(tmp_path / "results.duckdb")
+
+
+def test_resolve_dsn_ignores_blank_tokens(tmp_path):
+    dsn = storage.resolve_dsn(secrets={"motherduck": {"token": "  "}}, env={"MOTHERDUCK_TOKEN": ""},
+                              data_dir=str(tmp_path))
+    assert dsn.endswith("results.duckdb")
+
+
+def test_resolve_dsn_default_data_dir_is_dashboard_data():
+    dsn = storage.resolve_dsn(secrets={}, env={})
+    assert dsn == os.path.join(storage.DEFAULT_DATA_DIR, "results.duckdb")
+    assert dsn.endswith(os.path.join("dashboard", "data", "results.duckdb"))
