@@ -7,7 +7,7 @@ def test_can_import_scraper():
     assert callable(core.get_results)
 
 
-def test_can_import_dashboard_queries():
-    import dashboard_queries
+def test_can_import_dashboard_storage():
+    import storage
 
-    assert callable(dashboard_queries.init_db)
+    assert callable(storage.open_store)

@@ -1,11 +1,10 @@
-import json
 import math
-import os
 import re
 
 import duckdb
 import pandas as pd
 
+import storage
 from athlinks_scraper.providers.naming import race_group_label
 from storage import backfill_legacy_columns, extract_master_id_from_filename  # noqa: F401  (re-exported)
 
@@ -43,88 +42,16 @@ def init_db_from_dataframe(df):
     return con
 
 
-def init_db(uploaded_files):
-    """
-    Loads uploaded CSVs plus every CSV/Parquet in dashboard/data/ into one
-    DataFrame and returns a DuckDB connection with it registered as `results`.
-    """
-    dfs = []
-
-    for uploaded_file in uploaded_files:
-        try:
-            df = pd.read_csv(uploaded_file)
-            df.columns = [c.strip() for c in df.columns]
-            df = backfill_legacy_columns(df, uploaded_file.name)
-            dfs.append(df)
-        except Exception as e:
-            print(f"Error loading {uploaded_file.name}: {e}")
-
-    data_dir = os.path.join(os.path.dirname(__file__), "data")
-    if os.path.exists(data_dir):
-        for filename in os.listdir(data_dir):
-            if not (filename.endswith(".parquet") or filename.endswith(".csv")):
-                continue
-            try:
-                file_path = os.path.join(data_dir, filename)
-                if filename.endswith(".parquet"):
-                    df = pd.read_parquet(file_path)
-                else:
-                    df = pd.read_csv(file_path)
-                df.columns = [c.strip() for c in df.columns]
-                df = backfill_legacy_columns(df, filename)
-                dfs.append(df)
-            except Exception as e:
-                print(f"Error loading local file {filename}: {e}")
-
-    if dfs:
-        full_df = pd.concat(dfs, ignore_index=True)
-    else:
-        # Empty frame with the expected columns so views can still be created.
-        full_df = pd.DataFrame(columns=RESULT_COLUMNS)
-
-    return init_db_from_dataframe(full_df)
-
-
-def get_metadata_path():
-    return os.path.join(os.path.dirname(__file__), "data", "event_metadata.json")
-
-def load_event_metadata():
-    path = get_metadata_path()
-    if os.path.exists(path):
-        try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_custom_event_name(master_id, new_name):
-    metadata = load_event_metadata()
-    metadata[str(master_id)] = new_name.strip()
-    
-    path = get_metadata_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-
 def get_event_names(con):
     """
     One entry per Race Group: {'group_key', 'display_name', 'source_name', 'n_years'}.
-    display_name is the year-stripped event name, overridden by event_metadata.json.
+    display_name is the year-stripped event name, overridden by the
+    event_metadata table when present. `con` may be the durable store or a
+    plain in-memory connection that only has `results`.
     """
     try:
-        df = con.execute("""
-            SELECT
-                "Race Group" AS group_key,
-                FIRST("Event Name") AS event_name,
-                FIRST("Source") AS source_name,
-                COUNT(DISTINCT YEAR(TRY_CAST("Event Date" AS DATE))) AS n_years
-            FROM results
-            WHERE "Race Group" IS NOT NULL
-            GROUP BY "Race Group"
-            ORDER BY event_name ASC
-        """).df()
-        overrides = load_event_metadata()
+        df = storage.list_groups(con)
+        overrides = storage.load_event_metadata(con)
         groups = []
         for rec in df.to_dict('records'):
             key = str(rec["group_key"])

@@ -234,3 +234,21 @@ def import_files(con, data_dir: str) -> List[Tuple[str, int]]:
             print(f"import_files: {filename}: {e}")
             report.append((filename, -1))
     return report
+
+
+# --- display-name overrides -------------------------------------------------------
+
+def load_event_metadata(con) -> Dict[str, str]:
+    """{race_group: display_name}. {} if the table is absent (plain in-memory cons)."""
+    try:
+        rows = con.execute("SELECT race_group, display_name FROM event_metadata").fetchall()
+    except duckdb.CatalogException:
+        return {}
+    return {str(k): v for k, v in rows if v}
+
+
+def save_custom_event_name(con, group_key: str, display_name: str) -> None:
+    con.execute(
+        "INSERT OR REPLACE INTO event_metadata (race_group, display_name) VALUES (?, ?)",
+        [str(group_key), display_name.strip()],
+    )

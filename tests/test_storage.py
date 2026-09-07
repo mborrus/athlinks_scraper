@@ -162,3 +162,31 @@ def test_save_frame_drops_rows_with_no_resolvable_key(store):
     assert storage.save_frame(store, unkeyable, filename="random.csv") == 0
     assert storage.save_frame(store, unkeyable, filename="random.csv") == 0
     assert store.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+
+
+import dashboard_queries as dq
+
+
+def test_metadata_upsert_and_read(store):
+    storage.save_custom_event_name(store, "g1", "  Branford Trot ")
+    storage.save_custom_event_name(store, "g1", "Branford Turkey Trot")
+    assert storage.load_event_metadata(store) == {"g1": "Branford Turkey Trot"}
+
+
+def test_load_event_metadata_without_table_returns_empty(sample_results_df):
+    con = dq.init_db_from_dataframe(sample_results_df)  # has only `results`
+    assert storage.load_event_metadata(con) == {}
+
+
+def test_get_event_names_reads_store_and_honours_override(store):
+    storage.save_event(store, _frame(["A"], date="2022-11-24"), _ref(date="2022-11-24"))
+    storage.save_event(store, _frame(["A"], event_id="e2"), _ref(event_id="e2"))
+    storage.save_custom_event_name(store, "g1", "My Trot")
+    groups = dq.get_event_names(store)
+    assert groups == [{"group_key": "g1", "display_name": "My Trot",
+                       "source_name": "athlinks", "n_years": 2}]
+
+
+def test_file_based_loaders_are_gone():
+    for name in ("init_db", "get_metadata_path"):
+        assert not hasattr(dq, name), name
