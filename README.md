@@ -32,11 +32,14 @@ RunSignup (`runsignup.com` — use the *Results* page URL, which contains the nu
 None require an API key.
 
 ### Dashboard
+From the repository root:
+
 ```bash
-cd dashboard
-pip install -r requirements.txt
-streamlit run app.py
+pip install -r requirements-dev.txt
+streamlit run dashboard/app.py
 ```
+
+See `dashboard/README.md` for the MotherDuck deployment.
 
 ## Development
 

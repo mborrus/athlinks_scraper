@@ -89,7 +89,31 @@ def open_store(dsn: str):
     return con
 
 
+def cursor(con):
+    """
+    A per-request cursor that sees the same catalog as `con`. A plain
+    con.cursor() starts in the instance default catalog, which is not the
+    MotherDuck database selected by USE in open_store.
+    """
+    cur = con.cursor()
+    db = con.execute("SELECT current_database()").fetchone()[0]
+    cur.execute(f"USE {_q(db)}")
+    return cur
+
+
 # --- frame conformance -----------------------------------------------------------
+
+GROUP_KEY_PATTERN = r"[A-Za-z0-9_-]+"
+_NON_KEY_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def slugify_group_key(value) -> Optional[str]:
+    """'Turkey Trot 2019!' -> 'turkey-trot-2019'; None/blank -> None."""
+    if value is None:
+        return None
+    text = _NON_KEY_CHARS.sub("-", str(value).strip().lower()).strip("-")
+    return text or None
+
 
 def _to_str_or_none(value):
     if value is None:
@@ -132,9 +156,11 @@ def _replace_rows(con, source: str, event_id: str, conformed: pd.DataFrame) -> i
     """
     if conformed.empty:
         return 0
-    con.register("_incoming", conformed)
-    con.begin()
+    registered = False
     try:
+        con.register("_incoming", conformed)
+        registered = True
+        con.begin()
         con.execute(
             'DELETE FROM results WHERE "Source" = ? AND "Event ID" = ?',
             [source, event_id],
@@ -142,10 +168,16 @@ def _replace_rows(con, source: str, event_id: str, conformed: pd.DataFrame) -> i
         con.execute(f"INSERT INTO results SELECT {COLUMN_LIST_SQL}, now() FROM _incoming")
         con.commit()
     except Exception:
-        con.rollback()
+        # If begin() itself failed there is no transaction to roll back, and a
+        # raising rollback would mask the real error.
+        try:
+            con.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        con.unregister("_incoming")
+        if registered:
+            con.unregister("_incoming")
     return int(len(conformed))
 
 
@@ -203,6 +235,9 @@ def save_frame(con, df: pd.DataFrame, filename: Optional[str] = None) -> int:
     if df is None or df.empty:
         return 0
     conformed = conform(df, filename)
+    # Uploads carry free-text group names; the store and the enriched view both
+    # require a slug key, so normalize before anything is written durably.
+    conformed["Race Group"] = conformed["Race Group"].map(slugify_group_key)
     missing = conformed["Event ID"].isna()
     conformed.loc[missing, "Event ID"] = conformed.loc[missing, "Race Group"]
     conformed = conformed[conformed["Source"].notna() & conformed["Event ID"].notna()]
@@ -258,7 +293,9 @@ def save_custom_event_name(con, group_key: str, display_name: str) -> None:
 def import_metadata_json(con, path: str) -> int:
     """
     One-shot import of the legacy event_metadata.json ({race_group: name}).
-    Upserts every entry; returns how many. 0 if the file is missing or unreadable.
+    Upserts every entry; returns how many. 0 if the file is missing; -1 if it
+    exists but cannot be read or parsed, so callers can fail the run instead of
+    silently migrating without the display names.
     """
     if not os.path.exists(path):
         return 0
@@ -267,7 +304,7 @@ def import_metadata_json(con, path: str) -> int:
             data = json.load(f)
     except Exception as e:
         print(f"import_metadata_json: {path}: {e}")
-        return 0
+        return -1
     count = 0
     for key, name in (data or {}).items():
         if name and str(name).strip():

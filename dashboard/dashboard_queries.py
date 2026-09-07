@@ -10,12 +10,6 @@ from storage import backfill_legacy_columns, extract_master_id_from_filename  # 
 
 # Dashboard Queries Module
 
-RESULT_COLUMNS = [
-    "Source", "Race Group", "Event ID", "Event Name", "Event Date", "Race Type", "Name",
-    "Gender", "Age", "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
-    "Gender Rank", "Division Rank", "Status",
-]
-
 
 def format_seconds(total_seconds):
     """
@@ -49,23 +43,19 @@ def get_event_names(con):
     event_metadata table when present. `con` may be the durable store or a
     plain in-memory connection that only has `results`.
     """
-    try:
-        df = storage.list_groups(con)
-        overrides = storage.load_event_metadata(con)
-        groups = []
-        for rec in df.to_dict('records'):
-            key = str(rec["group_key"])
-            groups.append({
-                "group_key": key,
-                "display_name": overrides.get(key) or race_group_label(rec["event_name"] or key),
-                "source_name": rec["source_name"],
-                "n_years": int(rec["n_years"]),
-            })
-        groups.sort(key=lambda g: g["display_name"].lower())
-        return groups
-    except Exception as e:
-        print(f"Error getting event names: {e}")
-        return []
+    df = storage.list_groups(con)
+    overrides = storage.load_event_metadata(con)
+    groups = []
+    for rec in df.to_dict('records'):
+        key = str(rec["group_key"])
+        groups.append({
+            "group_key": key,
+            "display_name": overrides.get(key) or race_group_label(rec["event_name"] or key),
+            "source_name": rec["source_name"],
+            "n_years": int(rec["n_years"]),
+        })
+    groups.sort(key=lambda g: g["display_name"].lower())
+    return groups
 
 
 def create_enriched_view(con, selected_group=None):
@@ -101,7 +91,7 @@ def create_enriched_view(con, selected_group=None):
 
     if selected_group is not None:
         key = str(selected_group)
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        if not re.fullmatch(storage.GROUP_KEY_PATTERN, key):
             raise ValueError(f"Race Group key contains unsafe characters: {selected_group!r}")
         where_clause += f" AND \"Race Group\" = '{key}'"
 

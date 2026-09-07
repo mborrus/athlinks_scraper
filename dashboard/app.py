@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 import pandas as pd
@@ -37,16 +38,22 @@ def _secrets_dict():
 
 DSN = storage.resolve_dsn(secrets=_secrets_dict(), env=os.environ)
 
+_TOKEN_RE = re.compile(r"motherduck_token=[^&\s'\"]+")
+
+
+def _redact(exc):
+    return _TOKEN_RE.sub("motherduck_token=***", str(exc))
+
 
 @st.cache_resource(show_spinner="Connecting to the results store…")
 def get_store(dsn):
     return storage.open_store(dsn)
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading race…")
+@st.cache_data(ttl=3600, max_entries=2, show_spinner="Loading race…")
 def load_group_cached(dsn, group_key):
     # `dsn` is only here so the cache key changes if the store does.
-    return storage.load_group(get_store(dsn).cursor(), group_key)
+    return storage.load_group(storage.cursor(get_store(dsn)), group_key)
 
 
 def flash(level, text):
@@ -66,7 +73,7 @@ def invalidate_and_rerun():
 try:
     store = get_store(DSN)
 except Exception as e:
-    print(f"open_store failed: {e}")
+    print(f"open_store failed: {_redact(e)}")
     st.error("Could not open the results store. Check the app logs for the DuckDB error.")
     st.caption("If this is the hosted app, check the `motherduck` token in the app's Secrets.")
     st.stop()
@@ -81,7 +88,7 @@ def scrape_url(url):
     progress = st.progress(0)
     status = st.empty()
     failed = []
-    cur = store.cursor()
+    cur = storage.cursor(store)
     for i, ref in enumerate(refs):
         status.text(f"Scraping {ref.name} ({ref.date_str})…")
         try:
@@ -98,7 +105,7 @@ def scrape_url(url):
 
 
 def import_uploads(files):
-    cur = store.cursor()
+    cur = storage.cursor(store)
     total = 0
     failed = False
     for f in files:
@@ -140,7 +147,12 @@ with st.sidebar:
         import_uploads(uploaded_files)
 
 # --- Data ----------------------------------------------------------------------
-groups = dq.get_event_names(store.cursor())
+try:
+    groups = dq.get_event_names(storage.cursor(store))
+except Exception as e:
+    print(f"list races failed: {_redact(e)}")
+    st.error("Could not read the results store. Check the app logs for the DuckDB error.")
+    st.stop()
 if not groups:
     masthead("Turkey Trot Results Program", "No races loaded yet",
              "Add a race from the sidebar to print your program.")
@@ -156,7 +168,7 @@ display_name = labels[picked]["display_name"]
 with st.sidebar.expander("Rename this race"):
     new_name = st.text_input("Display name", value=display_name)
     if st.button("Save name") and new_name and new_name != display_name:
-        storage.save_custom_event_name(store.cursor(), selected_group, new_name)
+        storage.save_custom_event_name(storage.cursor(store), selected_group, new_name)
         invalidate_and_rerun()
 
 con = dq.init_db_from_dataframe(load_group_cached(DSN, selected_group))

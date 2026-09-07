@@ -1,4 +1,6 @@
+import duckdb
 import pandas as pd
+import pytest
 
 import dashboard_queries as dq
 
@@ -53,3 +55,9 @@ def test_backfill_legacy_columns_leaves_new_files_alone():
 
 def test_retention_data_function_removed():
     assert not hasattr(dq, "get_retention_data")
+
+
+def test_get_event_names_raises_on_missing_results_table():
+    con = duckdb.connect(":memory:")
+    with pytest.raises(duckdb.CatalogException):
+        dq.get_event_names(con)

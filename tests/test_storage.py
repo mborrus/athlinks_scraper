@@ -1,5 +1,6 @@
 import os
 
+import duckdb
 import numpy as np
 import pandas as pd
 import pytest
@@ -221,3 +222,35 @@ def test_import_metadata_json_upserts_and_tolerates_missing(store, tmp_path):
     assert storage.import_metadata_json(store, str(path)) == 2
     assert storage.load_event_metadata(store) == {"15776": "Branford Turkey Trot", "9": "Nine"}
     assert storage.import_metadata_json(store, str(tmp_path / "nope.json")) == 0
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("not json")
+    assert storage.import_metadata_json(store, str(corrupt)) == -1
+
+
+def test_cursor_follows_parent_catalog():
+    con = duckdb.connect(":memory:")
+    con.execute("ATTACH ':memory:' AS other")
+    con.execute("USE other")
+    storage.ensure_schema(con)  # creates results/event_metadata inside `other`
+    plain = con.cursor()
+    with pytest.raises(duckdb.CatalogException):
+        plain.execute("SELECT COUNT(*) FROM results")
+    cur = storage.cursor(con)
+    assert cur.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+    assert cur.execute("SELECT current_database()").fetchone()[0] == "other"
+
+
+def test_slugify_group_key():
+    assert storage.slugify_group_key("Turkey Trot 2019!") == "turkey-trot-2019"
+    assert storage.slugify_group_key("  ok-key_1 ") == "ok-key_1"
+    assert storage.slugify_group_key("!!!") is None
+    assert storage.slugify_group_key(None) is None
+
+
+def test_save_frame_slugifies_uploaded_group_keys(store):
+    df = _frame(["A"], group="Turkey Trot 2019!", event_id="e1")
+    storage.save_frame(store, df, "upload.csv")
+    assert storage.list_groups(store)["group_key"].tolist() == ["turkey-trot-2019"]
+    import dashboard_queries as dq
+    con = dq.init_db_from_dataframe(storage.load_group(store, "turkey-trot-2019"))
+    dq.create_enriched_view(con, "turkey-trot-2019")  # must not raise

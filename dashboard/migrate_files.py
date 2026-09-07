@@ -44,15 +44,18 @@ def main(argv=None):
     con = storage.open_store(dsn)
     report = storage.import_files(con, args.data_dir)
     names = storage.import_metadata_json(con, os.path.join(args.data_dir, "event_metadata.json"))
-    if names:
+    failed = 0
+    if names < 0:
+        print("event_metadata.json: FAILED")
+        failed += 1
+    elif names:
         print(f"event_metadata.json: {names} display names")
     if not report:
         print("no .parquet/.csv files found in", args.data_dir)
-        return 0
-    failed = 0
     for filename, rows in report:
         print(f"{filename}: {'FAILED' if rows < 0 else f'{rows} rows'}")
         failed += rows < 0
+    con.close()
     return 1 if failed else 0
 
 

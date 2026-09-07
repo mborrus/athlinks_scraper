@@ -35,6 +35,9 @@ Have old `scraped_*.parquet` files? Import them once:
 python dashboard/migrate_files.py            # reads dashboard/data/*.parquet|csv
 ```
 
+`restore_data.py` (repo root) writes legacy parquet files into `dashboard/data/`;
+run it before `migrate_files.py` if you use it.
+
 ## Deploy (Streamlit Community Cloud + MotherDuck)
 
 The hosted container has no durable disk, so results live in a free
