@@ -155,3 +155,10 @@ def test_import_files_reads_parquet_and_csv_and_isolates_failures(store, tmp_pat
 
 def test_import_files_missing_dir_returns_empty(store, tmp_path):
     assert storage.import_files(store, str(tmp_path / "nope")) == []
+
+
+def test_save_frame_drops_rows_with_no_resolvable_key(store):
+    unkeyable = pd.DataFrame([{"Name": "NoGroup", "Time": "20:00"}])
+    assert storage.save_frame(store, unkeyable, filename="random.csv") == 0
+    assert storage.save_frame(store, unkeyable, filename="random.csv") == 0
+    assert store.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0

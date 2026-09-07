@@ -194,16 +194,19 @@ def save_frame(con, df: pd.DataFrame, filename: Optional[str] = None) -> int:
     legacy parquet file). Rows are grouped by (Source, Event ID) and each
     group replaces its predecessor. A null Event ID falls back to the Race
     Group so old single-year files still replace cleanly.
+
+    Rows with no resolvable Source or Event ID are dropped and not counted:
+    without a key they could never be replaced on a later import, so storing
+    them would accumulate a fresh orphan row every time the file is read.
     """
     if df is None or df.empty:
         return 0
     conformed = conform(df, filename)
     missing = conformed["Event ID"].isna()
     conformed.loc[missing, "Event ID"] = conformed.loc[missing, "Race Group"]
+    conformed = conformed[conformed["Source"].notna() & conformed["Event ID"].notna()]
     total = 0
-    for (source, event_id), part in conformed.groupby(["Source", "Event ID"], dropna=False, sort=False):
-        if source is None or event_id is None:
-            continue
+    for (source, event_id), part in conformed.groupby(["Source", "Event ID"], sort=False):
         total += _replace_rows(con, str(source), str(event_id), part.reset_index(drop=True))
     return total
 
