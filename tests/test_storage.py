@@ -1,0 +1,256 @@
+import os
+
+import duckdb
+import numpy as np
+import pandas as pd
+import pytest
+
+import storage
+
+
+@pytest.fixture
+def store():
+    return storage.open_store(":memory:")
+
+
+def _tables(con):
+    return {r[0] for r in con.execute("SELECT table_name FROM information_schema.tables").fetchall()}
+
+
+def test_open_store_memory_creates_both_tables(store):
+    assert {"results", "event_metadata"} <= _tables(store)
+
+
+def test_ensure_schema_is_idempotent(store):
+    storage.ensure_schema(store)
+    storage.ensure_schema(store)
+    cols = store.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'results'").fetchall()
+    assert len(cols) == len(storage.CANONICAL_COLUMNS) + 1  # + scraped_at
+
+
+def test_open_store_file_creates_parent_dir(tmp_path):
+    path = tmp_path / "nested" / "results.duckdb"
+    con = storage.open_store(str(path))
+    assert path.exists()
+    assert "results" in _tables(con)
+    con.close()
+
+
+def test_conform_adds_missing_columns_and_coerces_types():
+    df = pd.DataFrame([{"Source": "athlinks", "Race Group": "1", "Event ID": "9",
+                        "Name": "A", "Age": "abc", "Overall Rank": "3", "Bib": 12}])
+    out = storage.conform(df)
+    assert list(out.columns) == storage.CANONICAL_COLUMNS
+    assert pd.isna(out.loc[0, "Age"])
+    assert out.loc[0, "Overall Rank"] == 3
+    assert out.loc[0, "Bib"] == "12"
+    assert out.loc[0, "City"] is None
+
+
+def test_conform_strips_column_whitespace_and_backfills_legacy():
+    df = pd.DataFrame([{" Name ": "A", "Master ID": "15776", "Time": "20:00"}])
+    out = storage.conform(df, filename="scraped_15776_2022.parquet")
+    assert out.loc[0, "Name"] == "A"
+    assert out.loc[0, "Race Group"] == "15776"
+    assert out.loc[0, "Source"] == "athlinks"
+
+
+def test_conform_keeps_nan_as_null_not_string():
+    df = pd.DataFrame([{"Source": "nyrr", "Race Group": "g", "Event ID": "e", "City": np.nan}])
+    out = storage.conform(df)
+    assert out.loc[0, "City"] is None
+
+
+from athlinks_scraper.providers.base import EventRef
+
+
+def _ref(event_id="e1", group="g1", source="athlinks", date="2023-11-23"):
+    return EventRef(source=source, event_id=event_id, name="Trot", date_str=date, race_group=group)
+
+
+def _frame(names, group="g1", event_id="e1", source="athlinks", date="2023-11-23"):
+    return pd.DataFrame([{
+        "Source": source, "Race Group": group, "Event ID": event_id, "Event Name": "Trot",
+        "Event Date": date, "Race Type": "5K", "Name": n, "Gender": "F", "Age": 30,
+        "Time": "20:00", "Pace": "6:26", "Overall Rank": i + 1, "Status": "CONF",
+    } for i, n in enumerate(names)])
+
+
+def test_save_event_inserts_rows_with_scraped_at(store):
+    n = storage.save_event(store, _frame(["A", "B"]), _ref())
+    assert n == 2
+    rows = store.execute('SELECT "Name", scraped_at FROM results ORDER BY "Name"').fetchall()
+    assert [r[0] for r in rows] == ["A", "B"]
+    assert all(r[1] is not None for r in rows)
+
+
+def test_save_event_replaces_same_event_instead_of_appending(store):
+    storage.save_event(store, _frame(["A", "B", "C"]), _ref())
+    storage.save_event(store, _frame(["D"]), _ref())
+    names = [r[0] for r in store.execute('SELECT "Name" FROM results').fetchall()]
+    assert names == ["D"]
+
+
+def test_save_event_keeps_other_events_and_sources(store):
+    storage.save_event(store, _frame(["A"]), _ref())
+    storage.save_event(store, _frame(["B"], event_id="e2"), _ref(event_id="e2"))
+    storage.save_event(store, _frame(["C"], source="nyrr", event_id="e1"), _ref(source="nyrr"))
+    storage.save_event(store, _frame(["Z"]), _ref())  # replaces only athlinks/e1
+    names = sorted(r[0] for r in store.execute('SELECT "Name" FROM results').fetchall())
+    assert names == ["B", "C", "Z"]
+
+
+def test_save_event_empty_frame_is_noop(store):
+    storage.save_event(store, _frame(["A"]), _ref())
+    n = storage.save_event(store, pd.DataFrame(), _ref())
+    assert n == 0
+    assert store.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 1
+
+
+def test_load_group_returns_only_that_group_with_canonical_columns(store):
+    storage.save_event(store, _frame(["A", "B"]), _ref())
+    storage.save_event(store, _frame(["C"], group="g2", event_id="e9"), _ref(event_id="e9", group="g2"))
+    df = storage.load_group(store, "g1")
+    assert list(df.columns) == storage.CANONICAL_COLUMNS
+    assert sorted(df["Name"]) == ["A", "B"]
+    assert storage.load_group(store, "nope").empty
+
+
+def test_list_groups_counts_distinct_years(store):
+    storage.save_event(store, _frame(["A"], date="2022-11-24"), _ref(date="2022-11-24"))
+    storage.save_event(store, _frame(["A"], event_id="e2", date="2023-11-23"), _ref(event_id="e2"))
+    storage.save_event(store, _frame(["Q"], group="g2", event_id="x", source="nyrr"),
+                       _ref(group="g2", event_id="x", source="nyrr"))
+    groups = storage.list_groups(store).set_index("group_key")
+    assert int(groups.loc["g1", "n_years"]) == 2
+    assert groups.loc["g1", "source_name"] == "athlinks"
+    assert groups.loc["g2", "event_name"] == "Trot"
+
+
+def test_save_frame_splits_by_event_and_replaces_each(store):
+    both = pd.concat([_frame(["A"], event_id="e1"), _frame(["B"], event_id="e2")], ignore_index=True)
+    assert storage.save_frame(store, both) == 2
+    storage.save_frame(store, _frame(["A2"], event_id="e1"))
+    names = sorted(r[0] for r in store.execute('SELECT "Name" FROM results').fetchall())
+    assert names == ["A2", "B"]
+
+
+def test_save_frame_uses_race_group_when_event_id_missing(store):
+    legacy = pd.DataFrame([{"Master ID": "15776", "Name": "Old", "Time": "20:00",
+                            "Event Date": "2019-11-28", "Event Name": "Trot"}])
+    storage.save_frame(store, legacy, filename="scraped_15776_2019.parquet")
+    row = store.execute('SELECT "Source", "Race Group", "Event ID" FROM results').fetchone()
+    assert row == ("athlinks", "15776", "15776")
+
+
+def test_import_files_reads_parquet_and_csv_and_isolates_failures(store, tmp_path):
+    _frame(["P"], event_id="p").to_parquet(tmp_path / "scraped_athlinks_g1_2023_p.parquet", index=False)
+    _frame(["C"], event_id="c").to_csv(tmp_path / "upload.csv", index=False)
+    (tmp_path / "broken.parquet").write_bytes(b"not a parquet file")
+    (tmp_path / "ignore.txt").write_text("x")
+    report = dict(storage.import_files(store, str(tmp_path)))
+    assert report["scraped_athlinks_g1_2023_p.parquet"] == 1
+    assert report["upload.csv"] == 1
+    assert report["broken.parquet"] == -1
+    assert "ignore.txt" not in report
+    assert store.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 2
+
+
+def test_import_files_missing_dir_returns_empty(store, tmp_path):
+    assert storage.import_files(store, str(tmp_path / "nope")) == []
+
+
+def test_save_frame_drops_rows_with_no_resolvable_key(store):
+    unkeyable = pd.DataFrame([{"Name": "NoGroup", "Time": "20:00"}])
+    assert storage.save_frame(store, unkeyable, filename="random.csv") == 0
+    assert storage.save_frame(store, unkeyable, filename="random.csv") == 0
+    assert store.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+
+
+import dashboard_queries as dq
+
+
+def test_metadata_upsert_and_read(store):
+    storage.save_custom_event_name(store, "g1", "  Branford Trot ")
+    storage.save_custom_event_name(store, "g1", "Branford Turkey Trot")
+    assert storage.load_event_metadata(store) == {"g1": "Branford Turkey Trot"}
+
+
+def test_load_event_metadata_without_table_returns_empty(sample_results_df):
+    con = dq.init_db_from_dataframe(sample_results_df)  # has only `results`
+    assert storage.load_event_metadata(con) == {}
+
+
+def test_get_event_names_reads_store_and_honours_override(store):
+    storage.save_event(store, _frame(["A"], date="2022-11-24"), _ref(date="2022-11-24"))
+    storage.save_event(store, _frame(["A"], event_id="e2"), _ref(event_id="e2"))
+    storage.save_custom_event_name(store, "g1", "My Trot")
+    groups = dq.get_event_names(store)
+    assert groups == [{"group_key": "g1", "display_name": "My Trot",
+                       "source_name": "athlinks", "n_years": 2}]
+
+
+def test_file_based_loaders_are_gone():
+    for name in ("init_db", "get_metadata_path"):
+        assert not hasattr(dq, name), name
+
+
+def test_resolve_dsn_prefers_secrets_then_env_then_local_file(tmp_path):
+    secrets = {"motherduck": {"token": "SECRET"}}
+    env = {"MOTHERDUCK_TOKEN": "ENV"}
+    assert storage.resolve_dsn(secrets=secrets, env=env) == "md:?motherduck_token=SECRET"
+    assert storage.resolve_dsn(secrets={}, env=env) == "md:?motherduck_token=ENV"
+    local = storage.resolve_dsn(secrets={}, env={}, data_dir=str(tmp_path))
+    assert local == str(tmp_path / "results.duckdb")
+
+
+def test_resolve_dsn_ignores_blank_tokens(tmp_path):
+    dsn = storage.resolve_dsn(secrets={"motherduck": {"token": "  "}}, env={"MOTHERDUCK_TOKEN": ""},
+                              data_dir=str(tmp_path))
+    assert dsn.endswith("results.duckdb")
+
+
+def test_resolve_dsn_default_data_dir_is_dashboard_data():
+    dsn = storage.resolve_dsn(secrets={}, env={})
+    assert dsn == os.path.join(storage.DEFAULT_DATA_DIR, "results.duckdb")
+    assert dsn.endswith(os.path.join("dashboard", "data", "results.duckdb"))
+
+
+def test_import_metadata_json_upserts_and_tolerates_missing(store, tmp_path):
+    path = tmp_path / "event_metadata.json"
+    path.write_text('{"15776": "Branford Turkey Trot", "16521": "  ", "9": "Nine"}')
+    assert storage.import_metadata_json(store, str(path)) == 2
+    assert storage.load_event_metadata(store) == {"15776": "Branford Turkey Trot", "9": "Nine"}
+    assert storage.import_metadata_json(store, str(tmp_path / "nope.json")) == 0
+    corrupt = tmp_path / "corrupt.json"
+    corrupt.write_text("not json")
+    assert storage.import_metadata_json(store, str(corrupt)) == -1
+
+
+def test_cursor_follows_parent_catalog():
+    con = duckdb.connect(":memory:")
+    con.execute("ATTACH ':memory:' AS other")
+    con.execute("USE other")
+    storage.ensure_schema(con)  # creates results/event_metadata inside `other`
+    plain = con.cursor()
+    with pytest.raises(duckdb.CatalogException):
+        plain.execute("SELECT COUNT(*) FROM results")
+    cur = storage.cursor(con)
+    assert cur.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+    assert cur.execute("SELECT current_database()").fetchone()[0] == "other"
+
+
+def test_slugify_group_key():
+    assert storage.slugify_group_key("Turkey Trot 2019!") == "turkey-trot-2019"
+    assert storage.slugify_group_key("  ok-key_1 ") == "ok-key_1"
+    assert storage.slugify_group_key("!!!") is None
+    assert storage.slugify_group_key(None) is None
+
+
+def test_save_frame_slugifies_uploaded_group_keys(store):
+    df = _frame(["A"], group="Turkey Trot 2019!", event_id="e1")
+    storage.save_frame(store, df, "upload.csv")
+    assert storage.list_groups(store)["group_key"].tolist() == ["turkey-trot-2019"]
+    import dashboard_queries as dq
+    con = dq.init_db_from_dataframe(storage.load_group(store, "turkey-trot-2019"))
+    dq.create_enriched_view(con, "turkey-trot-2019")  # must not raise

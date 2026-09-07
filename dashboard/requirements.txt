@@ -1,5 +1,5 @@
 streamlit
-duckdb
+duckdb>=1.4.1,<1.6
 pandas
 plotly
 requests

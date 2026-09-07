@@ -1,20 +1,14 @@
-import json
 import math
-import os
 import re
 
 import duckdb
 import pandas as pd
 
+import storage
 from athlinks_scraper.providers.naming import race_group_label
+from storage import backfill_legacy_columns, extract_master_id_from_filename  # noqa: F401  (re-exported)
 
 # Dashboard Queries Module
-
-RESULT_COLUMNS = [
-    "Source", "Race Group", "Event ID", "Event Name", "Event Date", "Race Type", "Name",
-    "Gender", "Age", "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
-    "Gender Rank", "Division Rank", "Status",
-]
 
 
 def format_seconds(total_seconds):
@@ -32,30 +26,6 @@ def format_seconds(total_seconds):
     return f"{minutes}:{seconds:02d}"
 
 
-def extract_master_id_from_filename(filename):
-    """scraped_15776_2023.parquet -> '15776'; anything else -> None."""
-    match = re.search(r'scraped_(\d+)_', filename)
-    if match:
-        return match.group(1)
-    return None
-
-
-def backfill_legacy_columns(df, filename):
-    """
-    Files written before multi-source support have a 'Master ID' column (or
-    only the master id in the filename) and no 'Source'/'Race Group'. Fill
-    them in so old and new files share one schema.
-    """
-    if "Race Group" not in df.columns:
-        if "Master ID" in df.columns:
-            df["Race Group"] = df["Master ID"].astype(str)
-        else:
-            df["Race Group"] = extract_master_id_from_filename(filename)
-    if "Source" not in df.columns:
-        df["Source"] = "athlinks"
-    return df
-
-
 def init_db_from_dataframe(df):
     """
     Creates an in-memory DuckDB connection with `df` registered as the
@@ -66,102 +36,26 @@ def init_db_from_dataframe(df):
     return con
 
 
-def init_db(uploaded_files):
-    """
-    Loads uploaded CSVs plus every CSV/Parquet in dashboard/data/ into one
-    DataFrame and returns a DuckDB connection with it registered as `results`.
-    """
-    dfs = []
-
-    for uploaded_file in uploaded_files:
-        try:
-            df = pd.read_csv(uploaded_file)
-            df.columns = [c.strip() for c in df.columns]
-            df = backfill_legacy_columns(df, uploaded_file.name)
-            dfs.append(df)
-        except Exception as e:
-            print(f"Error loading {uploaded_file.name}: {e}")
-
-    data_dir = os.path.join(os.path.dirname(__file__), "data")
-    if os.path.exists(data_dir):
-        for filename in os.listdir(data_dir):
-            if not (filename.endswith(".parquet") or filename.endswith(".csv")):
-                continue
-            try:
-                file_path = os.path.join(data_dir, filename)
-                if filename.endswith(".parquet"):
-                    df = pd.read_parquet(file_path)
-                else:
-                    df = pd.read_csv(file_path)
-                df.columns = [c.strip() for c in df.columns]
-                df = backfill_legacy_columns(df, filename)
-                dfs.append(df)
-            except Exception as e:
-                print(f"Error loading local file {filename}: {e}")
-
-    if dfs:
-        full_df = pd.concat(dfs, ignore_index=True)
-    else:
-        # Empty frame with the expected columns so views can still be created.
-        full_df = pd.DataFrame(columns=RESULT_COLUMNS)
-
-    return init_db_from_dataframe(full_df)
-
-
-def get_metadata_path():
-    return os.path.join(os.path.dirname(__file__), "data", "event_metadata.json")
-
-def load_event_metadata():
-    path = get_metadata_path()
-    if os.path.exists(path):
-        try:
-            with open(path, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_custom_event_name(master_id, new_name):
-    metadata = load_event_metadata()
-    metadata[str(master_id)] = new_name.strip()
-    
-    path = get_metadata_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-
 def get_event_names(con):
     """
     One entry per Race Group: {'group_key', 'display_name', 'source_name', 'n_years'}.
-    display_name is the year-stripped event name, overridden by event_metadata.json.
+    display_name is the year-stripped event name, overridden by the
+    event_metadata table when present. `con` may be the durable store or a
+    plain in-memory connection that only has `results`.
     """
-    try:
-        df = con.execute("""
-            SELECT
-                "Race Group" AS group_key,
-                FIRST("Event Name") AS event_name,
-                FIRST("Source") AS source_name,
-                COUNT(DISTINCT YEAR(TRY_CAST("Event Date" AS DATE))) AS n_years
-            FROM results
-            WHERE "Race Group" IS NOT NULL
-            GROUP BY "Race Group"
-            ORDER BY event_name ASC
-        """).df()
-        overrides = load_event_metadata()
-        groups = []
-        for rec in df.to_dict('records'):
-            key = str(rec["group_key"])
-            groups.append({
-                "group_key": key,
-                "display_name": overrides.get(key) or race_group_label(rec["event_name"] or key),
-                "source_name": rec["source_name"],
-                "n_years": int(rec["n_years"]),
-            })
-        groups.sort(key=lambda g: g["display_name"].lower())
-        return groups
-    except Exception as e:
-        print(f"Error getting event names: {e}")
-        return []
+    df = storage.list_groups(con)
+    overrides = storage.load_event_metadata(con)
+    groups = []
+    for rec in df.to_dict('records'):
+        key = str(rec["group_key"])
+        groups.append({
+            "group_key": key,
+            "display_name": overrides.get(key) or race_group_label(rec["event_name"] or key),
+            "source_name": rec["source_name"],
+            "n_years": int(rec["n_years"]),
+        })
+    groups.sort(key=lambda g: g["display_name"].lower())
+    return groups
 
 
 def create_enriched_view(con, selected_group=None):
@@ -197,7 +91,7 @@ def create_enriched_view(con, selected_group=None):
 
     if selected_group is not None:
         key = str(selected_group)
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        if not re.fullmatch(storage.GROUP_KEY_PATTERN, key):
             raise ValueError(f"Race Group key contains unsafe characters: {selected_group!r}")
         where_clause += f" AND \"Race Group\" = '{key}'"
 

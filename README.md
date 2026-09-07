@@ -32,11 +32,14 @@ RunSignup (`runsignup.com` — use the *Results* page URL, which contains the nu
 None require an API key.
 
 ### Dashboard
+From the repository root:
+
 ```bash
-cd dashboard
-pip install -r requirements.txt
-streamlit run app.py
+pip install -r requirements-dev.txt
+streamlit run dashboard/app.py
 ```
+
+See `dashboard/README.md` for the MotherDuck deployment.
 
 ## Development
 
@@ -57,3 +60,6 @@ query layer is tested against a small in-memory DuckDB table built in `tests/con
 
 `test_url.py` and `test_metadata.py` at the repo root are ad-hoc debugging scripts that
 hit the live API; they are not part of the test suite.
+
+Every push and pull request runs the test suite on Python 3.9 and 3.11 via
+GitHub Actions (`.github/workflows/tests.yml`).
