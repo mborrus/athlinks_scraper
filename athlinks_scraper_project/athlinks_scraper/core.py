@@ -1,8 +1,74 @@
+import time
 import requests
 import pandas as pd
 import re
 from datetime import datetime
 from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# --- HTTP configuration ---------------------------------------------------
+# Seconds to wait for the Athlinks API before giving up on one request.
+DEFAULT_TIMEOUT = 15
+# Seconds to pause between paginated results requests so we don't hammer the API.
+REQUEST_DELAY_SECONDS = 0.5
+# Hard cap on results pages per event (100 results/page -> 50,000 results).
+MAX_PAGES = 500
+
+_SESSION = None
+
+
+def build_session():
+    """
+    Creates a requests.Session that automatically retries transient failures.
+
+    Retries up to 3 times on connection errors and on 429/500/502/503/504
+    responses, sleeping 1s, 2s, 4s between attempts (backoff_factor=1).
+    """
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+def get_session():
+    """Returns the shared module-level session, creating it on first use."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = build_session()
+    return _SESSION
+
+
+def fetch_json(url, params=None, session=None, timeout=DEFAULT_TIMEOUT):
+    """
+    GETs `url` and returns the parsed JSON body.
+
+    Raises requests.RequestException (or a subclass such as HTTPError) if the
+    request ultimately fails after retries. Callers decide whether that is fatal.
+    """
+    session = session or get_session()
+    response = session.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def post_json(url, body, session=None, timeout=DEFAULT_TIMEOUT):
+    """
+    POSTs `body` as JSON to `url` and returns the parsed JSON response.
+    Raises requests.RequestException on failure (after the session's retries).
+    """
+    session = session or get_session()
+    response = session.post(url, json=body, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
 
 def extract_event_id(url):
     """
@@ -36,104 +102,86 @@ def extract_master_id(url):
         return match.group(1)
     return None
 
-def fetch_master_events(master_id):
+def fetch_master_events(master_id, session=None):
     """
     Fetches all child events for a given master event ID.
-    Returns a list of event objects (id, name, date).
+    Returns a list of event dicts (id, name, date, date_str), newest first.
+    Returns [] if the request fails.
     """
     url = f"https://reignite-api.athlinks.com/master/{master_id}/metadata"
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        
-        events = []
-        # The 'events' list in the JSON contains the child events
-        for event in data.get('events', []):
-            # Extract relevant info
-            events.append({
-                'id': event.get('id'),
-                'name': event.get('name'),
-                'date': event.get('start', {}).get('epoch'), # Timestamp
-                'date_str': pd.to_datetime(event.get('start', {}).get('epoch'), unit='ms').strftime('%Y-%m-%d') if event.get('start', {}).get('epoch') else 'Unknown'
-            })
-            
-        # Sort by date descending (newest first)
-        events.sort(key=lambda x: x['date'] or 0, reverse=True)
-        return events
-        
-    except Exception as e:
+        data = fetch_json(url, session=session)
+    except requests.RequestException as e:
         print(f"Error fetching master events: {e}")
         return []
 
-def fetch_metadata(event_id):
+    events = []
+    for event in data.get('events', []):
+        epoch = (event.get('start') or {}).get('epoch')
+        events.append({
+            'id': event.get('id'),
+            'name': event.get('name'),
+            'date': epoch,
+            'date_str': pd.to_datetime(epoch, unit='ms').strftime('%Y-%m-%d') if epoch else 'Unknown',
+        })
+
+    # Sort by date descending (newest first)
+    events.sort(key=lambda x: x['date'] or 0, reverse=True)
+    return events
+
+def fetch_metadata(event_id, session=None):
     """
-    Fetches event metadata (Name, Date, etc.)
+    Fetches event metadata (name, date, etc.). Returns {} if the request fails,
+    because metadata is optional enrichment and should not abort a scrape.
     """
     url = f"https://reignite-api.athlinks.com/event/{event_id}/metadata"
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
+        return fetch_json(url, session=session)
+    except requests.RequestException as e:
         print(f"Warning: Could not fetch metadata: {e}")
         return {}
 
-def fetch_results(event_id):
+def fetch_results(event_id, session=None):
     """
-    Fetches all results for the given event ID from the Athlinks API.
-    Handles pagination automatically.
-    Returns the raw list of course objects.
+    Fetches all results for the given event ID from the Athlinks API,
+    following pagination until a page contains zero results.
+
+    Returns the raw list of "course" blocks exactly as the API returned them
+    (parse_results flattens them). Pauses REQUEST_DELAY_SECONDS between pages
+    and stops after MAX_PAGES as a safety net.
+
+    Raises requests.RequestException if any page cannot be fetched, so callers
+    never receive a silently-truncated result set.
     """
     base_url = f"https://reignite-api.athlinks.com/event/{event_id}/results"
-    # We need to store the raw course objects to preserve the structure
-    # But pagination might return partial course objects?
-    # Let's accumulate the 'intervals' -> 'results' into a structure we can parse later.
-    # Actually, to keep it simple, let's just return a flat list of enriched result dicts here?
-    # No, separation of concerns. Let's return the raw data blocks.
-    
-    # Issue: The API returns a list of courses. Pagination likely appends results to the 'results' list inside the intervals.
-    # If we just append the whole response objects, we might duplicate course metadata but that's fine.
-    # We will parse it all together.
-    
-    all_data_blocks = []
     limit = 100
     from_index = 0
-    
+    all_data_blocks = []
+
     print(f"Fetching results for Event ID: {event_id}...")
-    
-    while True:
-        params = {
-            "correlationId": "",
-            "from": from_index,
-            "limit": limit
-        }
-        
-        try:
-            response = requests.get(base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching data: {e}")
-            break
-            
+
+    for page_number in range(MAX_PAGES):
+        params = {"correlationId": "", "from": from_index, "limit": limit}
+        data = fetch_json(base_url, params=params, session=session)
+
         batch_results_count = 0
-        
         if isinstance(data, list):
-            all_data_blocks.extend(data) # Store the raw blocks
+            all_data_blocks.extend(data)
             for course in data:
-                if 'intervals' in course:
-                    for interval in course['intervals']:
-                        if 'results' in interval:
-                            batch_results_count += len(interval['results'])
-        
+                for interval in course.get('intervals', []):
+                    batch_results_count += len(interval.get('results', []))
+
         print(f"Fetched {batch_results_count} results")
-        
+
         if batch_results_count == 0:
             break
-            
+
         from_index += limit
-        
+        if page_number + 1 < MAX_PAGES:
+            time.sleep(REQUEST_DELAY_SECONDS)
+    else:
+        print(f"Warning: stopped after {MAX_PAGES} pages; results may be incomplete.")
+
     return all_data_blocks
 
 def parse_results(data_blocks, metadata=None):
@@ -222,16 +270,16 @@ def results_to_df(data_blocks, metadata=None):
     df = pd.DataFrame(parsed)
     return df
 
-def get_results(url_or_id):
+def get_results(url_or_id, session=None):
     """
     Main entry point. Takes a URL or Event ID, fetches results, and returns a DataFrame.
+    Raises requests.RequestException if the results cannot be fetched.
     """
     if str(url_or_id).isdigit():
         event_id = url_or_id
     else:
         event_id = extract_event_id(url_or_id)
-        
-    metadata = fetch_metadata(event_id)
-    raw_data = fetch_results(event_id)
-    df = results_to_df(raw_data, metadata)
-    return df
+
+    metadata = fetch_metadata(event_id, session=session)
+    raw_data = fetch_results(event_id, session=session)
+    return results_to_df(raw_data, metadata)

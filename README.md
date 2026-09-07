@@ -22,8 +22,14 @@ A Streamlit-based dashboard to explore your race data.
 ```bash
 cd athlinks_scraper_project
 pip install -e .
-athlinks-scraper "https://www.athlinks.com/event/..."
+athlinks-scraper "https://www.athlinks.com/event/15776" --all-years -d out/
+athlinks-scraper "https://results.nyrr.org/event/24FROSTY/finishers" --all-years -d out/
+athlinks-scraper "https://runsignup.com/Race/Results/100692" --all-years -d out/
 ```
+
+Supported sources: Athlinks (`athlinks.com`), New York Road Runners (`results.nyrr.org`),
+RunSignup (`runsignup.com` — use the *Results* page URL, which contains the numeric race id).
+None require an API key.
 
 ### Dashboard
 ```bash
@@ -31,3 +37,23 @@ cd dashboard
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## Development
+
+Install everything (both components plus pytest) from the repository root:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run the test suite from the repository root (not from a subdirectory):
+
+```bash
+python -m pytest tests -v
+```
+
+The tests never contact Athlinks; HTTP is faked in `tests/fakes.py`. The dashboard
+query layer is tested against a small in-memory DuckDB table built in `tests/conftest.py`.
+
+`test_url.py` and `test_metadata.py` at the repo root are ad-hoc debugging scripts that
+hit the live API; they are not part of the test suite.

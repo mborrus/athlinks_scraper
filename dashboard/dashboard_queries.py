@@ -1,90 +1,112 @@
+import json
+import math
+import os
+import re
+
 import duckdb
 import pandas as pd
 
+from athlinks_scraper.providers.naming import race_group_label
+
 # Dashboard Queries Module
-def init_db(uploaded_files):
+
+RESULT_COLUMNS = [
+    "Source", "Race Group", "Event ID", "Event Name", "Event Date", "Race Type", "Name",
+    "Gender", "Age", "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank",
+    "Gender Rank", "Division Rank", "Status",
+]
+
+
+def format_seconds(total_seconds):
     """
-    Initializes an in-memory DuckDB connection and loads CSV files.
-    Returns the connection object.
+    1500 -> "25:00"; 3725 -> "1:02:05"; None or NaN -> "N/A".
+    Used wherever the UI shows a duration computed in SQL.
+    """
+    if total_seconds is None or (isinstance(total_seconds, float) and math.isnan(total_seconds)):
+        return "N/A"
+    total_seconds = int(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def extract_master_id_from_filename(filename):
+    """scraped_15776_2023.parquet -> '15776'; anything else -> None."""
+    match = re.search(r'scraped_(\d+)_', filename)
+    if match:
+        return match.group(1)
+    return None
+
+
+def backfill_legacy_columns(df, filename):
+    """
+    Files written before multi-source support have a 'Master ID' column (or
+    only the master id in the filename) and no 'Source'/'Race Group'. Fill
+    them in so old and new files share one schema.
+    """
+    if "Race Group" not in df.columns:
+        if "Master ID" in df.columns:
+            df["Race Group"] = df["Master ID"].astype(str)
+        else:
+            df["Race Group"] = extract_master_id_from_filename(filename)
+    if "Source" not in df.columns:
+        df["Source"] = "athlinks"
+    return df
+
+
+def init_db_from_dataframe(df):
+    """
+    Creates an in-memory DuckDB connection with `df` registered as the
+    `results` table. This is the seam that tests use.
     """
     con = duckdb.connect(database=':memory:')
-    
-    # Create a list to hold all dataframes
-    dfs = []
-    
-    import re
+    con.register('results', df)
+    return con
 
-    def extract_master_id_from_filename(filename):
-        match = re.search(r'scraped_(\d+)_', filename)
-        if match:
-            return match.group(1)
-        return None
+
+def init_db(uploaded_files):
+    """
+    Loads uploaded CSVs plus every CSV/Parquet in dashboard/data/ into one
+    DataFrame and returns a DuckDB connection with it registered as `results`.
+    """
+    dfs = []
 
     for uploaded_file in uploaded_files:
         try:
             df = pd.read_csv(uploaded_file)
-            # Ensure column names are consistent/clean
             df.columns = [c.strip() for c in df.columns]
-            
-            # Try to get Master ID from filename
-            master_id = extract_master_id_from_filename(uploaded_file.name)
-            if master_id:
-                df['Master ID'] = master_id
-            else:
-                df['Master ID'] = None
-                
+            df = backfill_legacy_columns(df, uploaded_file.name)
             dfs.append(df)
         except Exception as e:
             print(f"Error loading {uploaded_file.name}: {e}")
 
-    # Load local files from data directory
-    import os
-    # Use absolute path relative to this file
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     if os.path.exists(data_dir):
         for filename in os.listdir(data_dir):
-            if filename.endswith(".parquet") or filename.endswith(".csv"):
-                try:
-                    file_path = os.path.join(data_dir, filename)
-                    if filename.endswith(".parquet"):
-                        df = pd.read_parquet(file_path)
-                    else:
-                        df = pd.read_csv(file_path)
-                    
-                    df.columns = [c.strip() for c in df.columns]
-                    
-                    # Try to get Master ID from filename
-                    master_id = extract_master_id_from_filename(filename)
-                    if master_id:
-                        df['Master ID'] = master_id
-                    else:
-                        df['Master ID'] = None
-                        
-                    dfs.append(df)
-                except Exception as e:
-                    print(f"Error loading local file {filename}: {e}")
-            
-    if not dfs:
-        # Create empty DataFrame with expected columns to prevent Catalog Error
-        columns = [
-            "Event ID", "Event Name", "Event Date", "Race Type", "Name", "Gender", "Age", 
-            "Bib", "City", "State", "Country", "Time", "Pace", "Overall Rank", 
-            "Gender Rank", "Division Rank", "Status", "Master ID"
-        ]
-        full_df = pd.DataFrame(columns=columns)
-    else:
-        # Concatenate all dataframes
+            if not (filename.endswith(".parquet") or filename.endswith(".csv")):
+                continue
+            try:
+                file_path = os.path.join(data_dir, filename)
+                if filename.endswith(".parquet"):
+                    df = pd.read_parquet(file_path)
+                else:
+                    df = pd.read_csv(file_path)
+                df.columns = [c.strip() for c in df.columns]
+                df = backfill_legacy_columns(df, filename)
+                dfs.append(df)
+            except Exception as e:
+                print(f"Error loading local file {filename}: {e}")
+
+    if dfs:
         full_df = pd.concat(dfs, ignore_index=True)
-        
-    # Register as a DuckDB table
-    # Register as a DuckDB table
-    con.register('results', full_df)
-    
-    return con
+    else:
+        # Empty frame with the expected columns so views can still be created.
+        full_df = pd.DataFrame(columns=RESULT_COLUMNS)
 
+    return init_db_from_dataframe(full_df)
 
-import json
-import os
 
 def get_metadata_path():
     return os.path.join(os.path.dirname(__file__), "data", "event_metadata.json")
@@ -110,137 +132,130 @@ def save_custom_event_name(master_id, new_name):
 
 def get_event_names(con):
     """
-    Returns a list of dictionaries with 'master_id' and 'display_name'.
-    Groups by Master ID and picks the most recent Event Name, 
-    overridden by custom names if available.
+    One entry per Race Group: {'group_key', 'display_name', 'source_name', 'n_years'}.
+    display_name is the year-stripped event name, overridden by event_metadata.json.
     """
     try:
-        # Get distinct Master IDs and their most recent Event Name
-        query = """
-            SELECT 
-                "Master ID" as master_id,
-                FIRST("Event Name") as display_name
-            FROM results 
-            WHERE "Master ID" IS NOT NULL
-            GROUP BY "Master ID"
-            ORDER BY display_name ASC
-        """
-        df = con.execute(query).df()
-        events = df.to_dict('records')
-        
-        # Apply custom overrides
-        metadata = load_event_metadata()
-        for event in events:
-            mid = str(event['master_id'])
-            if mid in metadata:
-                event['display_name'] = metadata[mid]
-                
-        return events
+        df = con.execute("""
+            SELECT
+                "Race Group" AS group_key,
+                FIRST("Event Name") AS event_name,
+                FIRST("Source") AS source_name,
+                COUNT(DISTINCT YEAR(TRY_CAST("Event Date" AS DATE))) AS n_years
+            FROM results
+            WHERE "Race Group" IS NOT NULL
+            GROUP BY "Race Group"
+            ORDER BY event_name ASC
+        """).df()
+        overrides = load_event_metadata()
+        groups = []
+        for rec in df.to_dict('records'):
+            key = str(rec["group_key"])
+            groups.append({
+                "group_key": key,
+                "display_name": overrides.get(key) or race_group_label(rec["event_name"] or key),
+                "source_name": rec["source_name"],
+                "n_years": int(rec["n_years"]),
+            })
+        groups.sort(key=lambda g: g["display_name"].lower())
+        return groups
     except Exception as e:
         print(f"Error getting event names: {e}")
         return []
 
-def create_enriched_view(con, selected_master_id=None):
+
+def create_enriched_view(con, selected_group=None):
     """
-    Creates or replaces the results_enriched view.
-    If selected_master_id is provided, filters data to that Master ID.
+    Creates or replaces the results_enriched view with parsed seconds, year,
+    normalized name and normalized race type. Drops DNFs and impossible times.
+    If selected_group is given, only that Race Group is included.
+
+    DuckDB cannot bind parameters inside CREATE VIEW, so the group key is
+    validated against a strict slug pattern instead.
     """
-    
-    # Base filter conditions
+    con.execute("""
+        CREATE OR REPLACE MACRO to_seconds(txt) AS CAST(
+            CASE
+                WHEN txt LIKE '%:%:%' THEN
+                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS DOUBLE) * 3600 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS DOUBLE) * 60 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 3) AS DOUBLE)
+                WHEN txt LIKE '%:%' THEN
+                    TRY_CAST(SPLIT_PART(txt, ':', 1) AS DOUBLE) * 60 +
+                    TRY_CAST(SPLIT_PART(txt, ':', 2) AS DOUBLE)
+                ELSE NULL
+            END AS INTEGER)
+    """)
+
     where_clause = """
         "Pace" IS NOT NULL AND "Pace" != ''
         AND "Time" IS NOT NULL
-        
-        -- Filter out anyone faster than 12:00 (720 seconds).
-        AND (
-            CASE 
-                WHEN "Time" LIKE '%:%:%' THEN 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 3600 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 3) AS INTEGER)
-                ELSE 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER)
-            END
-        ) > 720
-        -- Exclude DNF (Did Not Finish)
+        -- Anyone faster than 12:00 (720 s) is a timing error, not a finisher.
+        AND to_seconds("Time") > 720
         AND ("Status" IS NULL OR "Status" != 'DNF')
     """
-    
-    # Add Master ID Filter if selected
-    if selected_master_id:
-        where_clause += f" AND \"Master ID\" = '{selected_master_id}'"
 
-    query = f"""
+    if selected_group is not None:
+        key = str(selected_group)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            raise ValueError(f"Race Group key contains unsafe characters: {selected_group!r}")
+        where_clause += f" AND \"Race Group\" = '{key}'"
+
+    con.execute(f"""
         CREATE OR REPLACE VIEW results_enriched AS
         SELECT *,
-             -- 1. Parse Pace to Seconds
-             CASE 
-                WHEN "Pace" LIKE '%:%:%' THEN 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 1) AS INTEGER) * 3600 + 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 2) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 3) AS INTEGER)
-                ELSE 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 1) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Pace", ':', 2) AS INTEGER)
-             END as pace_seconds,
-
-             -- 2. Parse Time to Seconds
-             CASE 
-                WHEN "Time" LIKE '%:%:%' THEN 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 3600 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 3) AS INTEGER)
-                ELSE 
-                    TRY_CAST(SPLIT_PART("Time", ':', 1) AS INTEGER) * 60 + 
-                    TRY_CAST(SPLIT_PART("Time", ':', 2) AS INTEGER)
-             END as time_seconds,
-             
-             YEAR(CAST("Event Date" AS DATE)) as event_year,
-             
-             -- 3. Normalize Name
-             CASE 
+             to_seconds("Pace") as pace_seconds,
+             to_seconds("Time") as time_seconds,
+             YEAR(TRY_CAST("Event Date" AS DATE)) as event_year,
+             CASE
                 WHEN TRIM(UPPER("Name")) = 'NESBITT DREW' THEN 'DREW NESBITT'
                 ELSE TRIM(UPPER("Name"))
              END as "Name_Normalized",
-
-             -- 4. Normalize Race Type (Catch variations of 5k and 5 Mile)
-             CASE 
-                WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5k([- ]?run)?$') THEN '5K'
+             CASE
+                WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5k([- ]?(run|walk|run/walk))?$') THEN '5K'
                 WHEN REGEXP_MATCHES("Race Type", '(?i)^(run[- ]?)?5[- ]?mil(e|er)([- ]?run)?$') THEN '5 Mile'
                 ELSE "Race Type"
              END as "Race Type Normalized"
-
         FROM results
         WHERE {where_clause}
-    """
-    
-    con.execute(query)
+    """)
 
 def get_overview_stats(con):
     """
-    Returns basic stats: Total Runners, Avg Time, Fastest Time, and Fastest Runner Name.
+    Headline numbers for the primary race type: total finishers, average pace,
+    fastest/slowest time, who set the fastest time and in which year, and the
+    first year of data.
     """
     try:
         query = """
             WITH primary_race AS (
-                SELECT "Race Type Normalized" 
-                FROM results_enriched 
-                GROUP BY "Race Type Normalized" 
-                ORDER BY COUNT(*) DESC 
-                LIMIT 1
+                SELECT "Race Type Normalized" FROM results_enriched
+                GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+            ),
+            primary_rows AS (
+                SELECT * FROM results_enriched
+                WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
+            ),
+            fastest AS (
+                SELECT "Time", "Name", event_year
+                FROM primary_rows ORDER BY time_seconds ASC LIMIT 1
+            ),
+            slowest AS (
+                SELECT "Time" FROM primary_rows ORDER BY time_seconds DESC LIMIT 1
             )
-            SELECT 
+            SELECT
                 COUNT(*) as total_runners,
                 AVG(pace_seconds) as avg_pace_seconds,
-                (SELECT "Time" FROM results_enriched WHERE "Race Type Normalized" = (SELECT * FROM primary_race) ORDER BY time_seconds ASC LIMIT 1) as fastest_time,
-                (SELECT "Name" FROM results_enriched WHERE "Race Type Normalized" = (SELECT * FROM primary_race) ORDER BY time_seconds ASC LIMIT 1) as fastest_runner,
-                (SELECT "Time" FROM results_enriched WHERE "Race Type Normalized" = (SELECT * FROM primary_race) ORDER BY time_seconds DESC LIMIT 1) as slowest_time
-            FROM results_enriched
-            WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
+                (SELECT "Time" FROM fastest) as fastest_time,
+                (SELECT "Name" FROM fastest) as fastest_runner,
+                (SELECT event_year FROM fastest) as fastest_year,
+                MIN(event_year) as first_year,
+                (SELECT "Time" FROM slowest) as slowest_time
+            FROM primary_rows
         """
         return con.execute(query).df()
-    except Exception:
+    except Exception as e:
+        print(f"Error getting overview stats: {e}")
         return pd.DataFrame()
 
 def get_pace_partners(con, target_str, tolerance_seconds=10, search_type="Pace"):
@@ -294,22 +309,27 @@ def get_pace_partners(con, target_str, tolerance_seconds=10, search_type="Pace")
 
 def get_fun_stats(con):
     """
-    Returns some fun stats like most frequent runners.
+    "Frequent Flyers": runners who appear in more than one year, with their
+    best (lowest) pace. Pace is compared numerically via pace_seconds — the
+    "Pace" column is a string and would sort "10:00" before "9:40".
     """
     try:
-        # Hall of Fame (Most Races)
-        # Only useful if multiple files loaded
-        hall_of_fame = con.execute("""
-            SELECT "Name", COUNT(DISTINCT event_year) as race_count, MIN("Pace") as best_pace
+        df = con.execute("""
+            SELECT
+                "Name",
+                COUNT(DISTINCT event_year) as race_count,
+                MIN(pace_seconds) as best_pace_seconds
             FROM results_enriched
+            WHERE pace_seconds IS NOT NULL
             GROUP BY "Name_Normalized", "Name"
             HAVING COUNT(DISTINCT event_year) > 1
-            ORDER BY race_count DESC, best_pace ASC
+            ORDER BY race_count DESC, best_pace_seconds ASC
             LIMIT 10
         """).df()
-        
-        return hall_of_fame
-    except Exception:
+        df["best_pace"] = df["best_pace_seconds"].apply(format_seconds)
+        return df[["Name", "race_count", "best_pace"]]
+    except Exception as e:
+        print(f"Error getting fun stats: {e}")
         return pd.DataFrame()
 
 def get_distribution(con):
@@ -399,67 +419,6 @@ def get_nemesis(con, runner_name):
     except Exception as e:
         print(f"Error finding nemesis: {e}")
         return pd.DataFrame()
-
-def get_retention_data(con):
-    """
-    Calculates retention flow between years for Sankey diagram.
-    """
-    try:
-        # Get all years
-        years_df = con.execute("SELECT DISTINCT event_year FROM results_enriched ORDER BY event_year").df()
-        years = years_df['event_year'].tolist()
-        
-        if len(years) < 2:
-            return []
-
-        sankey_data = []
-        
-        for i in range(len(years) - 1):
-            year_current = years[i]
-            year_next = years[i+1]
-            
-            # Get runners in current year
-            current_runners = con.execute(f"SELECT Name_Normalized FROM results_enriched WHERE event_year = {year_current}").df()['Name_Normalized'].tolist()
-            current_set = set(current_runners)
-            
-            # Get runners in next year
-            next_runners = con.execute(f"SELECT Name_Normalized FROM results_enriched WHERE event_year = {year_next}").df()['Name_Normalized'].tolist()
-            next_set = set(next_runners)
-            
-            # Calculate flow
-            retained = len(current_set.intersection(next_set))
-            churned = len(current_set) - retained
-            new_runners = len(next_set) - retained
-            
-            # Source, Target, Value, Label
-            # 1. Retained: Year X -> Year X+1
-            sankey_data.append({
-                "source": str(year_current),
-                "target": str(year_next),
-                "value": retained,
-                "type": "Retained"
-            })
-            
-            # 2. Churned: Year X -> Churned (did not go to X+1)
-            sankey_data.append({
-                "source": str(year_current),
-                "target": f"Left after {year_current}",
-                "value": churned,
-                "type": "Churned"
-            })
-            
-            # 3. New: New -> Year X+1
-            sankey_data.append({
-                "source": f"New in {year_next}",
-                "target": str(year_next),
-                "value": new_runners,
-                "type": "New"
-            })
-            
-        return sankey_data
-    except Exception as e:
-        print(f"Error getting retention data: {e}")
-        return []
 
 def get_fastest_by_year(con):
     """
@@ -630,34 +589,32 @@ def get_raw_times(con):
 
 def get_competitiveness_stats(con, gender="All", age_min=0, age_max=100):
     """
-    Returns the 3rd and 10th place times by year, filtered by demographics.
+    Returns the 3rd and 10th place finish times (seconds) by year for the
+    primary race, filtered by gender ("All", "M" or "F") and age range.
     """
     try:
-        # Build Filter Clause
-        filters = []
+        params = [age_min, age_max]
+        gender_clause = ""
         if gender != "All":
-            filters.append(f"\"Gender\" = '{gender}'")
-        
-        filters.append(f"\"Age\" BETWEEN {age_min} AND {age_max}")
-        
-        where_clause = " AND ".join(filters)
-        if where_clause:
-            where_clause = "AND " + where_clause
+            gender_clause = 'AND "Gender" = ?'
+            params.append(gender)
 
         query = f"""
             WITH primary_race AS (
-                SELECT "Race Type Normalized" FROM results_enriched GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+                SELECT "Race Type Normalized" FROM results_enriched
+                GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
             ),
             ranked AS (
-                SELECT 
+                SELECT
                     event_year,
                     time_seconds,
                     ROW_NUMBER() OVER (PARTITION BY event_year ORDER BY time_seconds ASC) as rn
                 FROM results_enriched
                 WHERE "Race Type Normalized" = (SELECT * FROM primary_race)
-                  {where_clause}
+                  AND "Age" BETWEEN ? AND ?
+                  {gender_clause}
             )
-            SELECT 
+            SELECT
                 event_year,
                 MAX(CASE WHEN rn = 3 THEN time_seconds END) as time_top_3,
                 MAX(CASE WHEN rn = 10 THEN time_seconds END) as time_top_10
@@ -666,7 +623,7 @@ def get_competitiveness_stats(con, gender="All", age_min=0, age_max=100):
             GROUP BY event_year
             ORDER BY event_year
         """
-        return con.execute(query).df()
+        return con.execute(query, params).df()
     except Exception as e:
         print(f"Error getting competitiveness stats: {e}")
         return pd.DataFrame()
@@ -689,3 +646,106 @@ def get_avg_annual_runners(con):
     except Exception as e:
         print(f"Error getting avg annual runners: {e}")
         return 0
+
+
+# --- Feature queries ------------------------------------------------------
+
+_PRIMARY_RACE = """(
+    SELECT "Race Type Normalized" FROM results_enriched
+    GROUP BY "Race Type Normalized" ORDER BY COUNT(*) DESC LIMIT 1
+)"""
+
+
+def search_runner_names(con, fragment):
+    """Distinct normalized names containing `fragment` (case-insensitive), sorted."""
+    try:
+        df = con.execute(
+            'SELECT "Name_Normalized" FROM results_enriched WHERE "Name_Normalized" ILIKE ? '
+            'GROUP BY "Name_Normalized" ORDER BY "Name_Normalized"',
+            [f"%{fragment}%"],
+        ).df()
+        return df["Name_Normalized"].tolist()
+    except Exception as e:
+        print(f"Error searching names: {e}")
+        return []
+
+
+def get_runner_yearly(con, name_norm):
+    """
+    One row per year the runner finished the primary race: their time/pace,
+    computed place, field size, % of the field they beat, and the field median.
+    """
+    try:
+        query = f"""
+            WITH field AS (
+                SELECT event_year, COUNT(*) AS field_size, MEDIAN(time_seconds) AS median_seconds
+                FROM results_enriched
+                WHERE "Race Type Normalized" = {_PRIMARY_RACE}
+                GROUP BY event_year
+            ),
+            me AS (
+                SELECT event_year, "Time", "Pace", time_seconds
+                FROM results_enriched
+                WHERE "Name_Normalized" = ? AND "Race Type Normalized" = {_PRIMARY_RACE}
+            ),
+            placed AS (
+                SELECT m.*,
+                    (SELECT COUNT(*) FROM results_enriched r
+                     WHERE r.event_year = m.event_year
+                       AND r."Race Type Normalized" = {_PRIMARY_RACE}
+                       AND r.time_seconds < m.time_seconds) + 1 AS place
+                FROM me m
+            )
+            SELECT p.event_year, p."Time", p."Pace", p.time_seconds, p.place, f.field_size,
+                   ROUND(100.0 * (f.field_size - p.place) / f.field_size, 1) AS pct_beaten,
+                   f.median_seconds
+            FROM placed p JOIN field f USING (event_year)
+            ORDER BY p.event_year
+        """
+        return con.execute(query, [name_norm]).df()
+    except Exception as e:
+        print(f"Error getting runner yearly: {e}")
+        return pd.DataFrame()
+
+
+def get_head_to_head(con, name_a, name_b):
+    """Years both runners finished the same race type; diff_seconds = A - B."""
+    try:
+        query = """
+            SELECT a.event_year, a."Time" AS time_a, b."Time" AS time_b,
+                   a.time_seconds - b.time_seconds AS diff_seconds
+            FROM results_enriched a
+            JOIN results_enriched b
+              ON a.event_year = b.event_year
+             AND a."Race Type Normalized" = b."Race Type Normalized"
+            WHERE a."Name_Normalized" = ? AND b."Name_Normalized" = ?
+            ORDER BY a.event_year
+        """
+        return con.execute(query, [name_a, name_b]).df()
+    except Exception as e:
+        print(f"Error getting head to head: {e}")
+        return pd.DataFrame()
+
+
+def get_returning_counts(con):
+    """Per year: how many finishers were new vs had raced in an earlier year."""
+    try:
+        query = """
+            WITH first_seen AS (
+                SELECT "Name_Normalized", MIN(event_year) AS first_year
+                FROM results_enriched GROUP BY "Name_Normalized"
+            ),
+            appearances AS (
+                SELECT DISTINCT "Name_Normalized", event_year FROM results_enriched
+            )
+            SELECT a.event_year,
+                   CAST(SUM(CASE WHEN a.event_year = f.first_year THEN 1 ELSE 0 END) AS INTEGER) AS new_runners,
+                   CAST(SUM(CASE WHEN a.event_year > f.first_year THEN 1 ELSE 0 END) AS INTEGER) AS returning_runners
+            FROM appearances a JOIN first_seen f USING ("Name_Normalized")
+            GROUP BY a.event_year
+            ORDER BY a.event_year
+        """
+        return con.execute(query).df()
+    except Exception as e:
+        print(f"Error getting returning counts: {e}")
+        return pd.DataFrame()
