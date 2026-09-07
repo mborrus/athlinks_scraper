@@ -11,35 +11,57 @@ A powerful Streamlit-based dashboard for analyzing race results, finding pace pa
 - **Pace Partners**: Input your target pace to find other runners who finish near your time—perfect for finding training buddies or rivals!
 - **Hall of Fame**: Discover the "Frequent Flyers" who have raced the most times.
 
-## Installation
+## Run locally
 
-1.  Navigate to the dashboard directory:
-    ```bash
-    cd dashboard
-    ```
+From the repository root:
 
-2.  Install the required dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
+```bash
+pip install -r requirements-dev.txt
+streamlit run dashboard/app.py
+```
 
-## Usage
+With no MotherDuck token configured, results are stored in
+`dashboard/data/results.duckdb` (git-ignored). Add a race from the sidebar by
+pasting an Athlinks, NYRR, or RunSignup results URL, or upload CSVs and click
+**Import CSVs**. Scraped data persists across restarts.
 
-1.  Run the Streamlit app:
-    ```bash
-    streamlit run app.py
-    ```
+The local file store is single-process: stop the app before running
+`migrate_files.py` against it, or DuckDB will refuse to open the file. MotherDuck
+has no such limit.
 
-2.  **Upload Data**:
-    - Once the app opens in your browser, use the sidebar to upload one or more race result CSV files.
-    - **CSV Requirements**: The files should contain at least the following columns:
-        - `Name`
-        - `Time`
-        - `Pace` (Format: MM:SS or HH:MM:SS)
-        - `Event Date`
-        - `Race Type`
+Have old `scraped_*.parquet` files? Import them once:
 
-3.  **Explore**: Use the various sections to analyze the data!
+```bash
+python dashboard/migrate_files.py            # reads dashboard/data/*.parquet|csv
+```
+
+## Deploy (Streamlit Community Cloud + MotherDuck)
+
+The hosted container has no durable disk, so results live in a free
+MotherDuck database (10 GB on the Lite plan). The app pulls one race at a time
+into local DuckDB, so MotherDuck compute stays near zero.
+
+1. Create a MotherDuck account and an access token (Settings → Access Tokens).
+2. In Streamlit Community Cloud, deploy this repo with main file
+   `dashboard/app.py`.
+3. In the app's **Settings → Secrets**, paste:
+
+   ```toml
+   [motherduck]
+   token = "your-token"
+   ```
+
+4. To seed the cloud database with files from your laptop, run once:
+
+   ```bash
+   MOTHERDUCK_TOKEN=your-token python dashboard/migrate_files.py
+   ```
+
+5. `migrate_files.py` reads `.streamlit/secrets.toml` only on Python 3.11+
+   (or when the `tomli` package is installed). On older Pythons, pass the
+   token via the `MOTHERDUCK_TOKEN` environment variable as shown above.
+
+Anyone with the app URL can scrape or rename races; there is no login.
 
 ## Tech Stack
 
