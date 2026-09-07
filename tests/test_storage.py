@@ -213,3 +213,11 @@ def test_resolve_dsn_default_data_dir_is_dashboard_data():
     dsn = storage.resolve_dsn(secrets={}, env={})
     assert dsn == os.path.join(storage.DEFAULT_DATA_DIR, "results.duckdb")
     assert dsn.endswith(os.path.join("dashboard", "data", "results.duckdb"))
+
+
+def test_import_metadata_json_upserts_and_tolerates_missing(store, tmp_path):
+    path = tmp_path / "event_metadata.json"
+    path.write_text('{"15776": "Branford Turkey Trot", "16521": "  ", "9": "Nine"}')
+    assert storage.import_metadata_json(store, str(path)) == 2
+    assert storage.load_event_metadata(store) == {"15776": "Branford Turkey Trot", "9": "Nine"}
+    assert storage.import_metadata_json(store, str(tmp_path / "nope.json")) == 0

@@ -6,3 +6,7 @@ __pycache__/
 __pycache__/
 *.pyc
 .superpowers/
+.streamlit/secrets.toml
+*.duckdb
+*.duckdb.wal
+.venv*/

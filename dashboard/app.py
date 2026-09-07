@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "athlinks_scraper_project"))
 sys.path.insert(0, HERE)
 
 import dashboard_queries as dq  # noqa: E402
+import storage  # noqa: E402
 from athlinks_scraper.providers import detect_provider  # noqa: E402
 from sections import hall_of_fame, overview, predictor, report_card, runner_tools, trends  # noqa: E402
 from ui import theme  # noqa: E402
@@ -18,8 +19,6 @@ from ui.components import masthead  # noqa: E402
 st.set_page_config(page_title="Turkey Trot Results Program", layout="wide")
 theme.inject()
 
-DATA_DIR = os.path.join(HERE, "data")
-
 EXAMPLES = {
     "Branford Turkey Trot (Athlinks)": "https://www.athlinks.com/event/15776",
     "NYRR Frosty 5K (NYRR)": "https://results.nyrr.org/event/24FROSTY/finishers",
@@ -27,12 +26,40 @@ EXAMPLES = {
 }
 
 
-def save_event_frame(df, ref):
-    year = ref.date_str[:4] if ref.date_str and ref.date_str != "Unknown" else "unknown"
-    safe_event = "".join(ch for ch in ref.event_id if ch.isalnum() or ch in "-_")
-    os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, f"scraped_{ref.source}_{ref.race_group}_{year}_{safe_event}.parquet")
-    df.to_parquet(path, index=False)
+# --- Store --------------------------------------------------------------------------
+def _secrets_dict():
+    # st.secrets raises when no secrets.toml exists (the local-dev case).
+    try:
+        return st.secrets.to_dict()
+    except Exception:
+        return {}
+
+
+DSN = storage.resolve_dsn(secrets=_secrets_dict(), env=os.environ)
+
+
+@st.cache_resource(show_spinner="Connecting to the results store…")
+def get_store(dsn):
+    return storage.open_store(dsn)
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading race…")
+def load_group_cached(dsn, group_key):
+    # `dsn` is only here so the cache key changes if the store does.
+    return storage.load_group(get_store(dsn).cursor(), group_key)
+
+
+def invalidate_and_rerun():
+    load_group_cached.clear()
+    st.rerun()
+
+
+try:
+    store = get_store(DSN)
+except Exception as e:
+    st.error(f"Could not open the results store: {e}")
+    st.caption("If this is the hosted app, check the `motherduck` token in the app's Secrets.")
+    st.stop()
 
 
 def scrape_url(url):
@@ -44,12 +71,12 @@ def scrape_url(url):
     progress = st.progress(0)
     status = st.empty()
     failed = []
+    cur = store.cursor()
     for i, ref in enumerate(refs):
         status.text(f"Scraping {ref.name} ({ref.date_str})…")
         try:
             df = provider.fetch_event(ref)
-            if not df.empty:
-                save_event_frame(df, ref)
+            storage.save_event(cur, df, ref)
         except Exception as e:
             failed.append(f"{ref.name}: {e}")
         progress.progress((i + 1) / len(refs))
@@ -57,7 +84,19 @@ def scrape_url(url):
         st.warning("Finished with errors:\n\n" + "\n".join(f"- {f}" for f in failed))
     else:
         st.success("All editions scraped.")
-    st.rerun()
+    invalidate_and_rerun()
+
+
+def import_uploads(files):
+    cur = store.cursor()
+    total = 0
+    for f in files:
+        try:
+            total += storage.save_frame(cur, pd.read_csv(f), f.name)
+        except Exception as e:
+            st.error(f"{f.name}: {e}")
+    st.success(f"Imported {total:,} rows.")
+    invalidate_and_rerun()
 
 
 # --- Sidebar -----------------------------------------------------------------
@@ -80,34 +119,30 @@ with st.sidebar:
 
     st.divider()
     uploaded_files = st.file_uploader("Or upload CSV results", accept_multiple_files=True, type="csv")
+    if st.button("Import CSVs", disabled=not uploaded_files):
+        import_uploads(uploaded_files)
 
 # --- Data ----------------------------------------------------------------------
-has_local_data = os.path.isdir(DATA_DIR) and any(
-    f.endswith((".parquet", ".csv")) for f in os.listdir(DATA_DIR))
-if not uploaded_files and not has_local_data:
+groups = dq.get_event_names(store.cursor())
+if not groups:
     masthead("Turkey Trot Results Program", "No races loaded yet",
              "Add a race from the sidebar to print your program.")
     st.stop()
 
-con = dq.init_db(uploaded_files or [])
-groups = dq.get_event_names(con)
-selected_group = None
-display_name = "Race results"
+st.sidebar.divider()
+st.sidebar.header("Choose race")
+labels = {f"{g['display_name']}  ·  {g['n_years']} yr  ·  {g['source_name']}": g for g in groups}
+picked = st.sidebar.selectbox("Race", list(labels), index=0, label_visibility="collapsed")
+selected_group = labels[picked]["group_key"]
+display_name = labels[picked]["display_name"]
 
-if groups:
-    st.sidebar.divider()
-    st.sidebar.header("Choose race")
-    labels = {f"{g['display_name']}  ·  {g['n_years']} yr  ·  {g['source_name']}": g for g in groups}
-    picked = st.sidebar.selectbox("Race", list(labels), index=0, label_visibility="collapsed")
-    selected_group = labels[picked]["group_key"]
-    display_name = labels[picked]["display_name"]
+with st.sidebar.expander("Rename this race"):
+    new_name = st.text_input("Display name", value=display_name)
+    if st.button("Save name") and new_name and new_name != display_name:
+        storage.save_custom_event_name(store.cursor(), selected_group, new_name)
+        invalidate_and_rerun()
 
-    with st.sidebar.expander("Rename this race"):
-        new_name = st.text_input("Display name", value=display_name)
-        if st.button("Save name") and new_name and new_name != display_name:
-            dq.save_custom_event_name(selected_group, new_name)
-            st.rerun()
-
+con = dq.init_db_from_dataframe(load_group_cached(DSN, selected_group))
 dq.create_enriched_view(con, selected_group)
 
 # --- Masthead ------------------------------------------------------------------

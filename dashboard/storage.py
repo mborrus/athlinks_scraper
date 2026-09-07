@@ -8,6 +8,7 @@ The store is a DuckDB database reached through a DSN:
 
 Everything here is plain duckdb + pandas. No streamlit imports, ever.
 """
+import json
 import os
 import re
 from typing import Dict, List, Optional, Tuple
@@ -252,6 +253,27 @@ def save_custom_event_name(con, group_key: str, display_name: str) -> None:
         "INSERT OR REPLACE INTO event_metadata (race_group, display_name) VALUES (?, ?)",
         [str(group_key), display_name.strip()],
     )
+
+
+def import_metadata_json(con, path: str) -> int:
+    """
+    One-shot import of the legacy event_metadata.json ({race_group: name}).
+    Upserts every entry; returns how many. 0 if the file is missing or unreadable.
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"import_metadata_json: {path}: {e}")
+        return 0
+    count = 0
+    for key, name in (data or {}).items():
+        if name and str(name).strip():
+            save_custom_event_name(con, str(key), str(name))
+            count += 1
+    return count
 
 
 # --- DSN resolution ----------------------------------------------------------------
