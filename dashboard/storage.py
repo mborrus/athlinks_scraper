@@ -120,3 +120,67 @@ def conform(df: pd.DataFrame, filename: Optional[str] = None) -> pd.DataFrame:
         else:
             out[col] = pd.Series([_to_str_or_none(v) for v in out[col]], dtype="object")
     return out
+
+
+# --- writes ------------------------------------------------------------------------
+
+def _replace_rows(con, source: str, event_id: str, conformed: pd.DataFrame) -> int:
+    """
+    Deletes every row for (source, event_id) then inserts `conformed`.
+    One transaction: a failure leaves the old rows in place.
+    """
+    if conformed.empty:
+        return 0
+    con.register("_incoming", conformed)
+    con.begin()
+    try:
+        con.execute(
+            'DELETE FROM results WHERE "Source" = ? AND "Event ID" = ?',
+            [source, event_id],
+        )
+        con.execute(f"INSERT INTO results SELECT {COLUMN_LIST_SQL}, now() FROM _incoming")
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.unregister("_incoming")
+    return int(len(conformed))
+
+
+def save_event(con, df: pd.DataFrame, ref) -> int:
+    """
+    Stores one scraped event (an EventRef from a provider). Re-scraping the
+    same event replaces its rows. Returns rows inserted; 0 for an empty frame.
+    """
+    if df is None or df.empty:
+        return 0
+    conformed = conform(df)
+    # The provider frame already carries these, but the ref is authoritative.
+    conformed["Source"] = ref.source
+    conformed["Event ID"] = str(ref.event_id)
+    conformed["Race Group"] = ref.race_group
+    return _replace_rows(con, ref.source, str(ref.event_id), conformed)
+
+
+# --- reads -----------------------------------------------------------------------------
+
+def load_group(con, group_key: str) -> pd.DataFrame:
+    return con.execute(
+        f'SELECT {COLUMN_LIST_SQL} FROM results WHERE "Race Group" = ?', [group_key]
+    ).df()
+
+
+def list_groups(con) -> pd.DataFrame:
+    """One row per Race Group: group_key, event_name, source_name, n_years."""
+    return con.execute("""
+        SELECT
+            "Race Group" AS group_key,
+            FIRST("Event Name") AS event_name,
+            FIRST("Source") AS source_name,
+            COUNT(DISTINCT YEAR(TRY_CAST("Event Date" AS DATE))) AS n_years
+        FROM results
+        WHERE "Race Group" IS NOT NULL
+        GROUP BY "Race Group"
+        ORDER BY event_name ASC
+    """).df()
