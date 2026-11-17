@@ -65,9 +65,9 @@ def verdict(text):
 
 
 def chart(fig):
-    st.plotly_chart(theme.style_chart(fig), use_container_width=True,
+    st.plotly_chart(theme.style_chart(fig), width="stretch",
                     config={"displayModeBar": False, "scrollZoom": False})
 
 
 def table(df):
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
